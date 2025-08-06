@@ -27,6 +27,7 @@ app.use(morgan('combined'));
 app.use('/api/auth', require('../services/auth/routes'));
 app.use('/api/tracking', require('../services/tracking/routes'));
 app.use('/api/routes', require('../services/routes/routes'));
+app.use('/api/buses', require('../services/buses/routes'));
 app.use('/api/notifications', require('../services/notifications/routes'));
 app.use('/api/analytics', require('../services/analytics/routes'));
 app.use('/api/students', require('../services/student-data/routes'));

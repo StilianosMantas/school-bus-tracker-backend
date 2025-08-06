@@ -12,7 +12,9 @@ const routeSchema = Joi.object({
   name: Joi.string().min(3).max(100).required(),
   description: Joi.string().max(500).optional(),
   type: Joi.string().valid('regular', 'field_trip', 'special').default('regular'),
-  is_active: Joi.boolean().default(true)
+  is_active: Joi.boolean().default(true),
+  driver_id: Joi.string().uuid().allow(null).optional(),
+  bus_id: Joi.string().uuid().allow(null).optional()
 });
 
 const stopSchema = Joi.object({
@@ -42,6 +44,47 @@ router.get('/health', (req, res) => {
   });
 });
 
+// Get all drivers for assignment (Admin only)
+router.get('/drivers', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, full_name, email, phone')
+      .eq('role', 'driver')
+      .order('full_name');
+
+    if (error) {
+      logger.error('Failed to fetch drivers', { error });
+      return res.status(500).json({ error: 'Failed to fetch drivers' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Get drivers error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get all buses for assignment (Admin only)
+router.get('/buses', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('buses')
+      .select('id, bus_number, capacity, status')
+      .order('bus_number');
+
+    if (error) {
+      logger.error('Failed to fetch buses', { error });
+      return res.status(500).json({ error: 'Failed to fetch buses' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Get buses error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get all routes
 router.get('/', authenticateToken, async (req, res) => {
   try {
@@ -51,7 +94,9 @@ router.get('/', authenticateToken, async (req, res) => {
       .from('routes')
       .select(`
         *,
-        stops(*)
+        stops(*),
+        driver:profiles!driver_id(id, full_name, email, phone),
+        bus:buses!bus_id(id, bus_number, capacity, status)
       `)
       .order('name');
 
@@ -92,7 +137,9 @@ router.get('/:id', authenticateToken, async (req, res) => {
       .from('routes')
       .select(`
         *,
-        stops(*)
+        stops(*),
+        driver:profiles!driver_id(id, full_name, email, phone),
+        bus:buses!bus_id(id, bus_number, capacity, status)
       `)
       .eq('id', id)
       .single();
@@ -152,7 +199,7 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['name', 'description', 'type', 'is_active'];
+    const allowedFields = ['name', 'description', 'type', 'is_active', 'driver_id', 'bus_id'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
@@ -221,6 +268,29 @@ router.delete('/:id', authenticateToken, authorizeRoles(['admin']), async (req, 
     res.json({ message: 'Route deleted successfully' });
   } catch (error) {
     logger.error('Delete route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get stops for a route
+router.get('/:routeId/stops', authenticateToken, async (req, res) => {
+  try {
+    const { routeId } = req.params;
+
+    const { data, error } = await supabase
+      .from('stops')
+      .select('*')
+      .eq('route_id', routeId)
+      .order('stop_order');
+
+    if (error) {
+      logger.error('Failed to fetch stops', { error });
+      return res.status(500).json({ error: 'Failed to fetch stops' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Get stops error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -34,10 +34,13 @@ const studentSchema = Joi.object({
   grade: Joi.string().max(20).required(),
   address: Joi.string().max(200).required(),
   medical_info: Joi.string().max(500).allow('', null),
+  emergency_contact: Joi.string().max(100).allow('', null),
+  emergency_phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).allow('', null),
   parent_email: Joi.string().email().required(),
   parent_name: Joi.string().min(2).max(100).required(),
   parent_phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).required(),
-  stop_id: Joi.string().uuid().optional()
+  stop_id: Joi.string().uuid().allow(null).optional(),
+  is_active: Joi.boolean().default(true)
 });
 
 // Health check
@@ -215,7 +218,7 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['name', 'grade', 'address', 'medical_info', 'stop_id'];
+    const allowedFields = ['name', 'grade', 'address', 'medical_info', 'emergency_contact', 'emergency_phone', 'stop_id', 'is_active'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
@@ -785,6 +788,251 @@ router.get('/:studentId', authenticateToken, authorizeRoles(['parent', 'admin', 
     res.json({ student });
   } catch (error) {
     logger.error('Error fetching student:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get student route assignments
+router.get('/:studentId/routes', authenticateToken, authorizeRoles(['admin', 'parent']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+
+    // Verify parent is accessing their own child's data
+    if (req.user.role === 'parent') {
+      const { data: student } = await supabase
+        .from('students')
+        .select('parent_id')
+        .eq('id', studentId)
+        .single();
+
+      if (!student || student.parent_id !== req.user.id) {
+        return res.status(403).json({ error: 'Unauthorized access' });
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('student_stops')
+      .select(`
+        *,
+        stop:stops(*, route:routes(*))
+      `)
+      .eq('student_id', studentId)
+      .eq('is_active', true)
+      .order('created_at');
+
+    if (error) {
+      logger.error('Failed to fetch student routes', { error });
+      return res.status(500).json({ error: 'Failed to fetch student routes' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Get student routes error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add route assignment to student (Admin only)
+router.post('/:studentId/routes', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const { stop_id, route_type = 'regular', notes } = req.body;
+
+    if (!stop_id) {
+      return res.status(400).json({ error: 'Stop ID required' });
+    }
+
+    // Verify student exists
+    const { data: student } = await supabase
+      .from('students')
+      .select('id')
+      .eq('id', studentId)
+      .single();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Verify stop exists
+    const { data: stop } = await supabase
+      .from('stops')
+      .select('id, route_id')
+      .eq('id', stop_id)
+      .single();
+
+    if (!stop) {
+      return res.status(404).json({ error: 'Stop not found' });
+    }
+
+    // Insert into junction table
+    const { data, error } = await supabase
+      .from('student_stops')
+      .insert({
+        student_id: studentId,
+        stop_id,
+        route_type,
+        notes,
+        is_active: true
+      })
+      .select(`
+        *,
+        stop:stops(*, route:routes(*))
+      `)
+      .single();
+
+    if (error) {
+      if (error.code === '23505') { // Unique constraint violation
+        return res.status(400).json({ 
+          error: 'Student is already assigned to this stop for this route type' 
+        });
+      }
+      logger.error('Failed to assign student to route', { error });
+      return res.status(500).json({ error: 'Failed to assign student to route' });
+    }
+
+    logger.info('Student assigned to route', { 
+      studentId, 
+      stopId: stop_id, 
+      routeType: route_type,
+      userId: req.user.id 
+    });
+
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Add student route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update route assignment (Admin only)
+router.put('/:studentId/routes/:assignmentId', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId, assignmentId } = req.params;
+    const { stop_id, route_type, notes, is_active } = req.body;
+
+    const updates = {};
+    if (stop_id) updates.stop_id = stop_id;
+    if (route_type) updates.route_type = route_type;
+    if (notes !== undefined) updates.notes = notes;
+    if (is_active !== undefined) updates.is_active = is_active;
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    const { data, error } = await supabase
+      .from('student_stops')
+      .update(updates)
+      .eq('id', assignmentId)
+      .eq('student_id', studentId)
+      .select(`
+        *,
+        stop:stops(*, route:routes(*))
+      `)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Assignment not found' });
+      }
+      logger.error('Failed to update route assignment', { error });
+      return res.status(500).json({ error: 'Failed to update route assignment' });
+    }
+
+    logger.info('Route assignment updated', { 
+      assignmentId, 
+      studentId,
+      userId: req.user.id 
+    });
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Update route assignment error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove route assignment (Admin only)
+router.delete('/:studentId/routes/:assignmentId', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId, assignmentId } = req.params;
+
+    const { error } = await supabase
+      .from('student_stops')
+      .delete()
+      .eq('id', assignmentId)
+      .eq('student_id', studentId);
+
+    if (error) {
+      logger.error('Failed to remove route assignment', { error });
+      return res.status(500).json({ error: 'Failed to remove route assignment' });
+    }
+
+    logger.info('Route assignment removed', { 
+      assignmentId, 
+      studentId,
+      userId: req.user.id 
+    });
+
+    res.json({ message: 'Route assignment removed successfully' });
+  } catch (error) {
+    logger.error('Remove route assignment error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Batch assign multiple stops to student (Admin only)
+router.post('/:studentId/routes/batch', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const { assignments } = req.body;
+
+    if (!Array.isArray(assignments) || assignments.length === 0) {
+      return res.status(400).json({ error: 'Assignments array required' });
+    }
+
+    // Verify student exists
+    const { data: student } = await supabase
+      .from('students')
+      .select('id')
+      .eq('id', studentId)
+      .single();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Prepare batch insert data
+    const insertData = assignments.map(assignment => ({
+      student_id: studentId,
+      stop_id: assignment.stop_id,
+      route_type: assignment.route_type || 'regular',
+      notes: assignment.notes || null,
+      is_active: assignment.is_active !== undefined ? assignment.is_active : true
+    }));
+
+    const { data, error } = await supabase
+      .from('student_stops')
+      .insert(insertData)
+      .select(`
+        *,
+        stop:stops(*, route:routes(*))
+      `);
+
+    if (error) {
+      logger.error('Failed to batch assign routes', { error });
+      return res.status(500).json({ error: 'Failed to assign routes' });
+    }
+
+    logger.info('Batch route assignments created', { 
+      studentId,
+      count: data.length,
+      userId: req.user.id 
+    });
+
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Batch assign routes error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

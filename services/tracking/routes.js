@@ -296,6 +296,98 @@ router.get('/live', authenticateToken, (req, res) => {
   });
 });
 
+// SSE endpoint for admin dashboard updates
+router.get('/admin-updates', async (req, res) => {
+  try {
+    // Handle token from query parameter for SSE (EventSource doesn't support custom headers)
+    const token = req.query.token;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    // Verify token with Supabase
+    const { supabasePublic } = require('../../shared/database/supabase');
+    const { data: { user }, error } = await supabasePublic.auth.getUser(token);
+    
+    if (error || !user) {
+      logger.warn('Invalid token in SSE connection', { error: error?.message });
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    // Get user profile with role
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .single();
+
+    if (profileError) {
+      logger.error('Profile fetch failed in SSE', { userId: user.id, error: profileError });
+      return res.status(500).json({ error: 'Failed to fetch user profile' });
+    }
+
+    // Check role authorization
+    const userRole = profile?.role || 'parent';
+    if (!['admin', 'dispatcher'].includes(userRole)) {
+      logger.warn('Unauthorized SSE access', { userId: user.id, userRole });
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // Create authenticated user object
+    const authUser = {
+      id: user.id,
+      email: user.email,
+      role: userRole,
+      fullName: profile?.full_name,
+      phone: profile?.phone
+    };
+
+    // Set SSE headers
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Authorization'
+    });
+
+    // Send initial connection
+    res.write('data: {"type":"connected","message":"Admin dashboard connected"}\n\n');
+
+    // Location update handler
+    const locationHandler = (update) => {
+      res.write(`data: ${JSON.stringify({...update, type: 'location-update'})}\n\n`);
+    };
+
+    // Incident handler
+    const incidentHandler = (incident) => {
+      res.write(`data: ${JSON.stringify({...incident, type: 'incident'})}\n\n`);
+    };
+
+    // Add listeners
+    trackingEvents.on('location-update', locationHandler);
+    trackingEvents.on('critical-incident', incidentHandler);
+
+    // Keep connection alive
+    const keepAlive = setInterval(() => {
+      res.write('data: {"type":"ping"}\n\n');
+    }, 30000);
+
+    // Clean up on disconnect
+    req.on('close', () => {
+      trackingEvents.removeListener('location-update', locationHandler);
+      trackingEvents.removeListener('critical-incident', incidentHandler);
+      clearInterval(keepAlive);
+      logger.info('Admin SSE connection closed', { userId: authUser.id });
+    });
+
+  } catch (error) {
+    logger.error('Admin SSE connection error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Start trip (Driver only)
 router.post('/start-trip', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
   try {
@@ -415,21 +507,18 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// Report incident (Driver only)
-router.post('/incidents', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
+// Report incident (Driver and Admin)
+router.post('/incidents', authenticateToken, authorizeRoles(['driver', 'admin']), async (req, res) => {
   try {
     const incidentSchema = Joi.object({
-      trip_id: Joi.string().uuid().required(),
-      route_id: Joi.string().uuid().required(),
-      bus_id: Joi.string().uuid().required(),
+      schedule_id: Joi.string().uuid().required(),
       type: Joi.string().valid('mechanical', 'accident', 'behavior', 'traffic', 'weather', 'medical', 'other').required(),
       severity: Joi.string().valid('low', 'medium', 'high', 'critical').required(),
       description: Joi.string().required(),
       location: Joi.string().optional(),
       latitude: Joi.number().min(-90).max(90).optional(),
       longitude: Joi.number().min(-180).max(180).optional(),
-      students_involved: Joi.string().optional(),
-      reported_at: Joi.string().isoDate().required()
+      students_involved: Joi.string().optional()
     });
 
     const { error: validationError, value } = incidentSchema.validate(req.body);
@@ -437,16 +526,52 @@ router.post('/incidents', authenticateToken, authorizeRoles(['driver']), async (
       return res.status(400).json({ error: validationError.details[0].message });
     }
 
-    // Create incident record
+    // Verify schedule exists and user authorization
+    const { data: schedule, error: scheduleError } = await supabase
+      .from('schedules')
+      .select('*, routes(*), buses(*)')
+      .eq('id', value.schedule_id)
+      .single();
+
+    if (scheduleError || !schedule) {
+      logger.warn('Schedule not found for incident report', { 
+        userId: req.user.id, 
+        scheduleId: value.schedule_id,
+        error: scheduleError 
+      });
+      return res.status(404).json({ error: 'Schedule not found' });
+    }
+
+    // For drivers, verify they are assigned to this schedule
+    // For admins, allow creating incidents for any schedule
+    if (req.user.role === 'driver' && schedule.driver_id !== req.user.id) {
+      logger.warn('Unauthorized incident report attempt', { 
+        driverId: req.user.id, 
+        scheduleId: value.schedule_id 
+      });
+      return res.status(403).json({ error: 'Not authorized for this schedule' });
+    }
+
+    // Create incident record with derived fields from schedule
     const { data: incident, error: incidentError } = await supabase
       .from('incidents')
       .insert({
         ...value,
-        driver_id: req.user.id,
+        driver_id: req.user.role === 'driver' ? req.user.id : schedule.driver_id,
+        route_id: schedule.route_id,
+        bus_id: schedule.bus_id,
         status: 'open',
-        created_at: new Date().toISOString()
+        reported_at: new Date().toISOString()
       })
-      .select()
+      .select(`
+        *,
+        driver:profiles!driver_id(*),
+        schedule:schedules(
+          *,
+          route:routes(*),
+          bus:buses(*)
+        )
+      `)
       .single();
 
     if (incidentError) {
@@ -460,13 +585,21 @@ router.post('/incidents', authenticateToken, authorizeRoles(['driver']), async (
       trackingEvents.emit('critical-incident', {
         incident,
         driverId: req.user.id,
-        routeId: value.route_id,
-        busId: value.bus_id
+        routeId: schedule.route_id,
+        busId: schedule.bus_id
       });
     }
 
     logger.info(`Incident reported: ${incident.id} - Type: ${value.type}, Severity: ${value.severity}`);
-    res.json({ success: true, incident });
+    
+    // Transform the data to match frontend expectations
+    const transformedIncident = {
+      ...incident,
+      route: incident.schedule?.route || null,
+      bus: incident.schedule?.bus || null
+    };
+
+    res.json({ success: true, incident: transformedIncident });
   } catch (error) {
     logger.error('Error reporting incident:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -506,6 +639,36 @@ router.patch('/incidents/:id', authenticateToken, authorizeRoles(['admin', 'disp
   }
 });
 
+// Get available schedules for incident creation (Admin only)
+router.get('/schedules', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { date } = req.query;
+    const today = date || new Date().toISOString().split('T')[0];
+    
+    const { data: schedules, error } = await supabase
+      .from('schedules')
+      .select(`
+        *,
+        routes(id, name),
+        buses(id, license_plate),
+        driver:profiles!driver_id(id, full_name)
+      `)
+      .eq('date', today)
+      .in('status', ['scheduled', 'in_progress'])
+      .order('start_time');
+
+    if (error) {
+      logger.error('Failed to fetch schedules for incidents', { error });
+      return res.status(500).json({ error: 'Failed to fetch schedules' });
+    }
+
+    res.json({ schedules });
+  } catch (error) {
+    logger.error('Get schedules error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get incidents for admin/dispatcher
 router.get('/incidents', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
   try {
@@ -516,8 +679,11 @@ router.get('/incidents', authenticateToken, authorizeRoles(['admin', 'dispatcher
       .select(`
         *,
         driver:profiles!driver_id(*),
-        route:routes(*),
-        bus:buses(*)
+        schedule:schedules(
+          *,
+          route:routes(*),
+          bus:buses(*)
+        )
       `)
       .order('created_at', { ascending: false });
 
@@ -539,7 +705,14 @@ router.get('/incidents', authenticateToken, authorizeRoles(['admin', 'dispatcher
       return res.status(500).json({ error: 'Failed to fetch incidents' });
     }
 
-    res.json({ incidents });
+    // Transform the data to match frontend expectations
+    const transformedIncidents = incidents.map(incident => ({
+      ...incident,
+      route: incident.schedule?.route || null,
+      bus: incident.schedule?.bus || null
+    }));
+
+    res.json({ incidents: transformedIncidents });
   } catch (error) {
     logger.error('Error fetching incidents:', error);
     res.status(500).json({ error: 'Internal server error' });
