@@ -776,6 +776,63 @@ router.get('/template/download', authenticateToken, authorizeRoles(['admin']), (
   res.send(buffer);
 });
 
+// Export students to CSV (Admin only)
+router.get('/export', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { data: students, error } = await supabase
+      .from('students')
+      .select(`
+        *,
+        parent:profiles!parent_id(full_name, email, phone),
+        stop:stops(name, route:routes(name))
+      `)
+      .order('name');
+
+    if (error) {
+      logger.error('Failed to fetch students for export', { error });
+      return res.status(500).json({ error: 'Failed to fetch students' });
+    }
+
+    // Format data for CSV export
+    const csvData = students.map(student => ({
+      'Όνομα': student.name,
+      'Τάξη': student.grade,
+      'Διεύθυνση': student.address,
+      'Ιατρικές Πληροφορίες': student.medical_info || '',
+      'Δευτερεύουσα Επαφή': student.emergency_contact || '',
+      'Τηλέφωνο Δευτερεύουσας Επαφής': student.emergency_phone || '',
+      'Email Γονέα': student.parent?.email || '',
+      'Όνομα Γονέα': student.parent?.full_name || '',
+      'Τηλέφωνο Γονέα': student.parent?.phone || '',
+      'Στάση': student.stop?.name || '',
+      'Διαδρομή': student.stop?.route?.name || '',
+      'Ενεργός': student.is_active ? 'Ναι' : 'Όχι'
+    }));
+
+    // Convert to CSV
+    if (csvData.length === 0) {
+      return res.status(200).send('Δεν υπάρχουν μαθητές για εξαγωγή');
+    }
+
+    const headers = Object.keys(csvData[0]);
+    const csvContent = [
+      headers.join(','),
+      ...csvData.map(row => 
+        headers.map(header => 
+          `"${(row[header] || '').toString().replace(/"/g, '""')}"`
+        ).join(',')
+      )
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename=students_export.csv');
+    res.send('\uFEFF' + csvContent); // Add BOM for proper UTF-8 encoding in Excel
+  } catch (error) {
+    logger.error('Export students error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get students for a parent
 router.get('/parent/:parentId', authenticateToken, authorizeRoles(['parent', 'admin']), async (req, res) => {
   try {
