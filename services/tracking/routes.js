@@ -878,7 +878,7 @@ router.get('/schedules', authenticateToken, authorizeRoles(['admin', 'dispatcher
       .select(`
         *,
         routes(id, name),
-        buses(id, license_plate),
+        buses(id, bus_number),
         driver:profiles!driver_id(id, full_name)
       `)
       .eq('date', today)
