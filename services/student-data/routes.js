@@ -145,12 +145,15 @@ router.post('/', authenticateToken, authorizeRoles(['admin']), async (req, res) 
       .eq('email', parent_email)
       .single();
 
+    let parentWasCreated = false;
+    
     // Create parent if doesn't exist
     if (!parent) {
+      parentWasCreated = true;
       // Create auth user
       const { data: authData, error: authError } = await supabase.auth.admin.createUser({
         email: parent_email,
-        password: Math.random().toString(36).slice(-12), // Random password
+        password: Math.random().toString(36).slice(-12), // Temporary random password
         email_confirm: true,
         user_metadata: {
           full_name: parent_name
@@ -162,10 +165,32 @@ router.post('/', authenticateToken, authorizeRoles(['admin']), async (req, res) 
         return res.status(500).json({ error: 'Failed to create parent account' });
       }
 
-      // Create profile
+      // Send welcome email with magic link for new parents
+      const { data: magicLinkData, error: magicLinkError } = await supabase.auth.admin.generateLink({
+        type: 'magiclink',
+        email: parent_email,
+        options: {
+          redirectTo: `${process.env.REACT_APP_PARENT_URL || 'http://localhost:3001'}/welcome`
+        }
+      });
+
+      if (magicLinkError) {
+        logger.warn('Failed to send welcome magic link to new parent', { 
+          error: magicLinkError, 
+          parentEmail: parent_email 
+        });
+        // Don't fail the student creation if email fails, just log it
+      } else {
+        logger.info('Welcome magic link sent to new parent', { 
+          parentEmail: parent_email,
+          magicLink: magicLinkData.properties?.action_link 
+        });
+      }
+
+      // Update the existing profile created by the trigger, or create if doesn't exist
       const { data: profileData, error: profileError } = await supabase
         .from('profiles')
-        .insert({
+        .upsert({
           id: authData.user.id,
           email: parent_email,
           full_name: parent_name,
@@ -176,7 +201,7 @@ router.post('/', authenticateToken, authorizeRoles(['admin']), async (req, res) 
         .single();
 
       if (profileError) {
-        logger.error('Failed to create parent profile', { error: profileError });
+        logger.error('Failed to create/update parent profile', { error: profileError });
         return res.status(500).json({ error: 'Failed to create parent profile' });
       }
 
@@ -204,7 +229,14 @@ router.post('/', authenticateToken, authorizeRoles(['admin']), async (req, res) 
 
     logger.info('Student created', { studentId: student.id, userId: req.user.id });
 
-    res.status(201).json({ data: student });
+    // Include information about parent account creation in response
+    const response = { data: student };
+    if (parentWasCreated) {
+      response.parentAccountCreated = true;
+      response.message = 'Μαθητής δημιουργήθηκε επιτυχώς. Ο γονέας θα λάβει email καλωσορίσματος με σύνδεσμο για πρόσβαση στην εφαρμογή.';
+    }
+
+    res.status(201).json(response);
   } catch (error) {
     logger.error('Create student error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -253,6 +285,66 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
     res.json({ data });
   } catch (error) {
     logger.error('Update student error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get students for a specific route and stop (Driver/Admin only)
+router.get('/route/:routeId/stop/:stopId', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { routeId, stopId } = req.params;
+
+    // Fetch students from the database based on stop_id
+    const { data: students, error } = await supabase
+      .from('students')
+      .select(`
+        id,
+        name,
+        grade,
+        address,
+        medical_info,
+        emergency_contact,
+        emergency_phone,
+        parent:profiles!parent_id(
+          id,
+          full_name,
+          phone,
+          email
+        )
+      `)
+      .eq('stop_id', stopId)
+      .eq('is_active', true)
+      .order('name');
+
+    if (error) {
+      logger.error('Failed to fetch students for stop', { error, routeId, stopId });
+      return res.status(500).json({ error: 'Failed to fetch students' });
+    }
+
+    // Transform data to match frontend expectations
+    const studentsFormatted = students.map(student => ({
+      id: student.id,
+      name: student.name,
+      grade: student.grade,
+      medical_info: student.medical_info,
+      emergency_contact: student.emergency_contact,
+      emergency_phone: student.emergency_phone,
+      parent_phone: student.parent?.phone,
+      parent_name: student.parent?.full_name,
+      parent_email: student.parent?.email,
+      home_address: student.address
+    }));
+
+    logger.info('Students fetched for route/stop', { 
+      routeId, 
+      stopId, 
+      count: studentsFormatted.length,
+      driverId: req.user.id 
+    });
+
+    res.json(studentsFormatted);
+  } catch (error) {
+    logger.error('Get students error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -393,7 +485,7 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
         if (!parent) {
           const { data: authData, error: authError } = await supabase.auth.admin.createUser({
             email: parent_email,
-            password: Math.random().toString(36).slice(-12),
+            password: Math.random().toString(36).slice(-12), // Temporary random password
             email_confirm: true,
             user_metadata: {
               full_name: parent_name
@@ -410,10 +502,27 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
             continue;
           }
 
-          // Create profile
+          // Send welcome email with magic link for new parents
+          const { data: magicLinkData, error: magicLinkError } = await supabase.auth.admin.generateLink({
+            type: 'magiclink',
+            email: parent_email,
+            options: {
+              redirectTo: `${process.env.REACT_APP_PARENT_URL || 'http://localhost:3001'}/welcome`
+            }
+          });
+
+          if (magicLinkError) {
+            logger.warn('Failed to send welcome magic link during import', { 
+              error: magicLinkError, 
+              parentEmail: parent_email 
+            });
+            // Don't fail the import if email fails, just log it
+          }
+
+          // Update the existing profile created by the trigger, or create if doesn't exist
           const { data: profileData, error: profileError } = await supabase
             .from('profiles')
-            .insert({
+            .upsert({
               id: authData.user.id,
               email: parent_email,
               full_name: parent_name,

@@ -14,13 +14,31 @@ const authenticateToken = async (req, res, next) => {
 
     const token = authHeader.substring(7);
     
+    logger.info('Attempting to verify token', { 
+      tokenLength: token.length,
+      tokenStart: token.substring(0, 20) + '...',
+      hasToken: !!token
+    });
+    
     // Verify token with Supabase
     const { data: { user }, error } = await supabasePublic.auth.getUser(token);
     
     if (error || !user) {
-      logger.warn('Invalid token attempt', { error: error?.message });
+      logger.error('Token verification failed', { 
+        error: error?.message,
+        errorCode: error?.code,
+        hasUser: !!user,
+        tokenLength: token.length
+      });
       return res.status(401).json({ error: 'Invalid token' });
     }
+
+    logger.info('JWT user extracted', { 
+      userId: user.id, 
+      userEmail: user.email,
+      userIdType: typeof user.id,
+      userIdLength: user.id?.length 
+    });
 
     // Get user profile with role (use service key to bypass RLS)
     const { data: profile, error: profileError } = await supabase

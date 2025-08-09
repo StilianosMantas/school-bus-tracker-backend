@@ -268,7 +268,7 @@ router.post('/users', authenticateToken, authorizeRoles(['admin']), async (req, 
     // Create user in Supabase Auth
     const { data: authData, error: authError } = await supabase.auth.admin.createUser({
       email,
-      password: Math.random().toString(36).slice(-12), // Random temp password
+      password: Math.random().toString(36).slice(-12), // Temporary random password
       email_confirm: true,
       user_metadata: {
         full_name
@@ -280,58 +280,54 @@ router.post('/users', authenticateToken, authorizeRoles(['admin']), async (req, 
       return res.status(400).json({ error: authError.message });
     }
 
-    // Check if profile already exists (might be created by trigger)
-    const { data: existingProfile } = await supabase
+    // Send welcome email with magic link for new users
+    const redirectUrl = role === 'driver' ? 
+      `${process.env.REACT_APP_DRIVER_URL || 'http://localhost:3002'}/welcome` :
+      role === 'parent' ?
+      `${process.env.REACT_APP_PARENT_URL || 'http://localhost:3001'}/welcome` :
+      `${process.env.REACT_APP_ADMIN_URL || 'http://localhost:3003'}/welcome`;
+
+    const { data: magicLinkData, error: magicLinkError } = await supabase.auth.admin.generateLink({
+      type: 'magiclink',
+      email,
+      options: {
+        redirectTo: redirectUrl
+      }
+    });
+
+    if (magicLinkError) {
+      logger.warn('Failed to send welcome magic link to new user', { 
+        error: magicLinkError, 
+        email, 
+        role 
+      });
+      // Don't fail user creation if email fails, just log it
+    } else {
+      logger.info('Welcome magic link sent to new user', { 
+        email, 
+        role,
+        magicLink: magicLinkData.properties?.action_link 
+      });
+    }
+
+    // Update the existing profile created by the trigger, or create if doesn't exist
+    const { data: profile, error: profileError } = await supabase
       .from('profiles')
-      .select('*')
-      .eq('id', authData.user.id)
+      .upsert({
+        id: authData.user.id,
+        email,
+        full_name,
+        phone: phone || null,
+        role
+      })
+      .select()
       .single();
 
-    let profile;
-    
-    if (existingProfile) {
-      // Profile exists, update it with our data
-      const { data: updatedProfile, error: profileError } = await supabase
-        .from('profiles')
-        .update({
-          full_name,
-          phone: phone || null,
-          role
-        })
-        .eq('id', authData.user.id)
-        .select()
-        .single();
-
-      if (profileError) {
-        logger.error('Failed to update existing profile', { error: profileError });
-        // Cleanup: delete the auth user
-        await supabase.auth.admin.deleteUser(authData.user.id);
-        return res.status(500).json({ error: 'Failed to update user profile' });
-      }
-      
-      profile = updatedProfile;
-    } else {
-      // Create new profile
-      const { data: newProfile, error: profileError } = await supabase
-        .from('profiles')
-        .insert({
-          id: authData.user.id,
-          email,
-          full_name,
-          phone: phone || null,
-          role
-        })
-        .select()
-        .single();
-
-      if (profileError) {
-        logger.error('Failed to create profile', { error: profileError });
-        // Cleanup: delete the auth user
-        await supabase.auth.admin.deleteUser(authData.user.id);
-        return res.status(500).json({ error: 'Failed to create user profile' });
-      }
-      
-      profile = newProfile;
+    if (profileError) {
+      logger.error('Failed to create/update profile', { error: profileError });
+      // Cleanup: delete the auth user
+      await supabase.auth.admin.deleteUser(authData.user.id);
+      return res.status(500).json({ error: 'Failed to create user profile' });
     }
 
     logger.info('User created', { userId: profile.id, email, role, createdBy: req.user.id });
@@ -340,7 +336,8 @@ router.post('/users', authenticateToken, authorizeRoles(['admin']), async (req, 
       data: {
         ...profile,
         email_confirmed_at: authData.user.email_confirmed_at
-      }
+      },
+      message: `${role === 'driver' ? 'Οδηγός' : role === 'parent' ? 'Γονέας' : 'Χρήστης'} δημιουργήθηκε επιτυχώς. Θα λάβει email καλωσορίσματος με σύνδεσμο για πρόσβαση στην εφαρμογή.`
     });
   } catch (error) {
     logger.error('Create user error', { error: error.message });

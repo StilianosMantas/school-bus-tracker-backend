@@ -31,6 +31,140 @@ router.get('/health', (req, res) => {
   });
 });
 
+// Get driver's trip history
+router.get('/driver-trips', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+    const driverId = req.user.id;
+
+    // First get routes that belong to this driver
+    const { data: driverRoutes } = await supabase
+      .from('routes')
+      .select('id')
+      .or(`driver_id.eq.${driverId},permanent_driver_id.eq.${driverId}`);
+
+    if (!driverRoutes || driverRoutes.length === 0) {
+      return res.json({ data: [] });
+    }
+
+    const routeIds = driverRoutes.map(route => route.id);
+
+    // Query route_progress table for trips on routes assigned to this driver
+    let query = supabase
+      .from('route_progress')
+      .select(`
+        *,
+        routes!inner(name, type)
+      `)
+      .in('route_id', routeIds)
+      .order('date', { ascending: false })
+      .order('actual_start_time', { ascending: false });
+
+    if (start_date) {
+      query = query.gte('date', start_date);
+    }
+    if (end_date) {
+      query = query.lte('date', end_date);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to fetch driver trip history', { error, driverId, routeIds });
+      return res.status(500).json({ error: 'Failed to fetch trip history' });
+    }
+
+    res.json({ data: data || [] });
+  } catch (error) {
+    logger.error('Get driver trips error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Submit bulk GPS locations (Driver only) - for GPS service buffering
+router.post('/bulk', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
+  try {
+    const { locations } = req.body;
+
+    if (!locations || !Array.isArray(locations) || locations.length === 0) {
+      return res.status(400).json({ error: 'Locations array is required' });
+    }
+
+    let successCount = 0;
+    const errors = [];
+
+    for (const location of locations) {
+      try {
+        // Validate each location
+        const { error: validationError, value } = gpsSchema.validate({
+          scheduleId: location.tripId, // GPS service sends tripId, convert to scheduleId
+          latitude: location.latitude,
+          longitude: location.longitude,
+          speed: location.speed,
+          heading: location.heading,
+          accuracy: location.accuracy
+        });
+
+        if (validationError) {
+          errors.push({ location, error: validationError.details[0].message });
+          continue;
+        }
+
+        // Verify driver is assigned to this schedule
+        const { data: schedule, error: scheduleError } = await supabase
+          .from('schedules')
+          .select('*, routes(*), buses(*)')
+          .eq('id', value.scheduleId)
+          .eq('driver_id', req.user.id)
+          .single();
+
+        if (scheduleError || !schedule) {
+          errors.push({ location, error: 'Not authorized for this schedule' });
+          continue;
+        }
+
+        // Insert GPS data
+        const { error: insertError } = await supabase
+          .from('gps_tracks')
+          .insert({
+            schedule_id: value.scheduleId,
+            latitude: value.latitude,
+            longitude: value.longitude,
+            speed: value.speed || 0,
+            heading: value.heading,
+            accuracy: value.accuracy,
+            timestamp: location.timestamp || new Date().toISOString()
+          });
+
+        if (!insertError) {
+          successCount++;
+        } else {
+          errors.push({ location, error: insertError.message });
+        }
+      } catch (err) {
+        errors.push({ location, error: err.message });
+      }
+    }
+
+    logger.info('Bulk GPS data processed', { 
+      driverId: req.user.id,
+      total: locations.length,
+      successful: successCount,
+      errors: errors.length
+    });
+
+    res.json({ 
+      success: true,
+      processed: locations.length,
+      successful: successCount,
+      errors: errors.length > 0 ? errors : undefined
+    });
+  } catch (error) {
+    logger.error('Bulk location update error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Submit GPS location (Driver only)
 router.post('/location', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
   try {
@@ -391,8 +525,101 @@ router.get('/admin-updates', async (req, res) => {
 // Start trip (Driver only)
 router.post('/start-trip', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
   try {
-    const { scheduleId } = req.body;
+    const { scheduleId, routeId, busId } = req.body;
+    const today = new Date().toISOString().split('T')[0];
 
+    // Handle synthetic schedule IDs from the driver app
+    if (scheduleId && scheduleId.includes('_')) {
+      const [extractedRouteId, scheduleDate] = scheduleId.split('_');
+      
+      // Check if this is today's date
+      if (scheduleDate !== today) {
+        return res.status(400).json({ error: 'Cannot start trip for past or future dates' });
+      }
+
+      // Verify driver is assigned to this route
+      const { data: route, error: routeError } = await supabase
+        .from('routes')
+        .select('*')
+        .eq('id', extractedRouteId)
+        .eq('is_active', true)
+        .or(`driver_id.eq.${req.user.id},permanent_driver_id.eq.${req.user.id}`)
+        .single();
+
+      if (routeError || !route) {
+        return res.status(403).json({ error: 'Not authorized for this route' });
+      }
+
+      // Check if schedule already exists for today
+      const { data: existingSchedule } = await supabase
+        .from('schedules')
+        .select('*')
+        .eq('route_id', extractedRouteId)
+        .eq('driver_id', req.user.id)
+        .eq('date', today)
+        .single();
+
+      if (existingSchedule) {
+        if (existingSchedule.status === 'in_progress') {
+          return res.json({ 
+            success: true,
+            message: 'Trip already in progress',
+            schedule_id: existingSchedule.id
+          });
+        } else if (existingSchedule.status === 'completed') {
+          return res.status(400).json({ error: 'Trip already completed for today' });
+        }
+        
+        // Update existing schedule to in_progress
+        const { error: updateError } = await supabase
+          .from('schedules')
+          .update({ 
+            status: 'in_progress',
+            start_time: new Date().toISOString().split('T')[1].split('.')[0]
+          })
+          .eq('id', existingSchedule.id);
+
+        if (updateError) {
+          logger.error('Failed to start existing trip', { error: updateError });
+          return res.status(500).json({ error: 'Failed to start trip' });
+        }
+
+        logger.info('Existing trip started', { driverId: req.user.id, scheduleId: existingSchedule.id });
+        return res.json({ 
+          success: true,
+          message: 'Trip started successfully',
+          schedule_id: existingSchedule.id
+        });
+      }
+
+      // Create new schedule record
+      const { data: newSchedule, error: createError } = await supabase
+        .from('schedules')
+        .insert({
+          route_id: extractedRouteId,
+          bus_id: route.permanent_bus_id || route.bus_id,
+          driver_id: req.user.id,
+          date: today,
+          start_time: route.default_start_time || new Date().toISOString().split('T')[1].split('.')[0],
+          status: 'in_progress'
+        })
+        .select()
+        .single();
+
+      if (createError) {
+        logger.error('Failed to create schedule', { error: createError });
+        return res.status(500).json({ error: 'Failed to create schedule' });
+      }
+
+      logger.info('New trip started', { driverId: req.user.id, scheduleId: newSchedule.id });
+      return res.json({ 
+        success: true,
+        message: 'Trip started successfully',
+        schedule_id: newSchedule.id
+      });
+    }
+
+    // Handle regular schedule IDs (fallback for existing functionality)
     if (!scheduleId) {
       return res.status(400).json({ error: 'Schedule ID required' });
     }
@@ -403,7 +630,7 @@ router.post('/start-trip', authenticateToken, authorizeRoles(['driver']), async 
       .select('*')
       .eq('id', scheduleId)
       .eq('driver_id', req.user.id)
-      .eq('date', new Date().toISOString().split('T')[0])
+      .eq('date', today)
       .single();
 
     if (scheduleError || !schedule) {
@@ -432,7 +659,8 @@ router.post('/start-trip', authenticateToken, authorizeRoles(['driver']), async 
 
     res.json({ 
       success: true,
-      message: 'Trip started successfully' 
+      message: 'Trip started successfully',
+      schedule_id: scheduleId
     });
   } catch (error) {
     logger.error('Start trip error', { error: error.message });
@@ -515,10 +743,10 @@ router.post('/incidents', authenticateToken, authorizeRoles(['driver', 'admin'])
       type: Joi.string().valid('mechanical', 'accident', 'behavior', 'traffic', 'weather', 'medical', 'other').required(),
       severity: Joi.string().valid('low', 'medium', 'high', 'critical').required(),
       description: Joi.string().required(),
-      location: Joi.string().optional(),
+      location: Joi.string().allow('', null).optional(),
       latitude: Joi.number().min(-90).max(90).optional(),
       longitude: Joi.number().min(-180).max(180).optional(),
-      students_involved: Joi.string().optional()
+      students_involved: Joi.string().allow('', null).optional()
     });
 
     const { error: validationError, value } = incidentSchema.validate(req.body);
@@ -669,23 +897,24 @@ router.get('/schedules', authenticateToken, authorizeRoles(['admin', 'dispatcher
   }
 });
 
-// Get incidents for admin/dispatcher
-router.get('/incidents', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+// Get incidents for admin/dispatcher/driver
+router.get('/incidents', authenticateToken, authorizeRoles(['admin', 'dispatcher', 'driver']), async (req, res) => {
   try {
-    const { status, severity, type, date } = req.query;
+    const { status, severity, type, date, driver_id } = req.query;
     
     let query = supabase
       .from('incidents')
-      .select(`
-        *,
-        driver:profiles!driver_id(*),
-        schedule:schedules(
-          *,
-          route:routes(*),
-          bus:buses(*)
-        )
-      `)
+      .select('*')
       .order('created_at', { ascending: false });
+
+    // Restrict drivers to only see their own incidents
+    if (req.user.role === 'driver') {
+      // Try both possible field names for the driver
+      query = query.eq('driver_id', req.user.id);
+    } else if (driver_id) {
+      // Admin/dispatcher can filter by specific driver
+      query = query.eq('driver_id', driver_id);
+    }
 
     if (status) query = query.eq('status', status);
     if (severity) query = query.eq('severity', severity);
@@ -715,6 +944,309 @@ router.get('/incidents', authenticateToken, authorizeRoles(['admin', 'dispatcher
     res.json({ incidents: transformedIncidents });
   } catch (error) {
     logger.error('Error fetching incidents:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ========== ROUTE PROGRESS TRACKING ENDPOINTS ==========
+
+// Get route progress for a specific date
+router.get('/route-progress', authenticateToken, async (req, res) => {
+  try {
+    const { date, route_id, status } = req.query;
+    const targetDate = date || new Date().toISOString().split('T')[0];
+
+    let query = supabase
+      .from('route_progress')
+      .select(`
+        *,
+        routes(name, route_direction, estimated_duration_minutes),
+        current_stop:stops!current_stop_id(name, stop_order),
+        student_boarding(
+          id, student_name, action, timestamp, 
+          stop:stops(name, stop_order)
+        )
+      `)
+      .eq('date', targetDate)
+      .order('created_at');
+
+    if (route_id) query = query.eq('route_id', route_id);
+    if (status) query = query.eq('status', status);
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to fetch route progress', { error });
+      return res.status(500).json({ error: 'Failed to fetch route progress' });
+    }
+
+    // Calculate ETAs for in_progress routes
+    const progressWithETA = await Promise.all(data.map(async (progress) => {
+      if (progress.status === 'in_progress') {
+        const { data: etaData, error: etaError } = await supabase
+          .rpc('calculate_route_eta', { p_route_progress_id: progress.id });
+        
+        if (!etaError) {
+          progress.estimated_eta = etaData;
+        }
+      }
+      return progress;
+    }));
+
+    res.json({ data: progressWithETA, date: targetDate });
+  } catch (error) {
+    logger.error('Get route progress error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Start a route
+router.post('/route-progress/:route_id/start', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { route_id } = req.params;
+    const { current_location, schedule_id } = req.body;
+    const today = new Date().toISOString().split('T')[0];
+
+    // Check if route progress already exists for today
+    const { data: existing } = await supabase
+      .from('route_progress')
+      .select('*')
+      .eq('route_id', route_id)
+      .eq('date', today)
+      .single();
+
+    if (existing) {
+      return res.status(400).json({ error: 'Route already started today' });
+    }
+
+    // Create route progress record
+    const { data, error } = await supabase
+      .from('route_progress')
+      .insert({
+        route_id,
+        schedule_id: schedule_id || null,
+        date: today,
+        status: 'in_progress',
+        actual_start_time: new Date().toISOString(),
+        current_location: current_location || null,
+        total_students_onboard: 0
+      })
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to start route', { error });
+      return res.status(500).json({ error: 'Failed to start route' });
+    }
+
+    logger.info('Route started', { 
+      routeId: route_id, 
+      progressId: data.id,
+      userId: req.user.id 
+    });
+
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Start route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update route location and progress
+router.put('/route-progress/:id/location', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { current_location, current_stop_id } = req.body;
+
+    const updateData = {
+      current_location,
+      updated_at: new Date().toISOString()
+    };
+
+    if (current_stop_id !== undefined) {
+      updateData.current_stop_id = current_stop_id;
+    }
+
+    const { data, error } = await supabase
+      .from('route_progress')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to update route location', { error });
+      return res.status(500).json({ error: 'Failed to update route location' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Update route location error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Record student boarding/offboarding
+router.post('/route-progress/:id/student-boarding', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { id: route_progress_id } = req.params;
+    const { student_name, stop_id, action, notes } = req.body;
+
+    if (!student_name || !stop_id || !action) {
+      return res.status(400).json({ error: 'Student name, stop ID, and action are required' });
+    }
+
+    const { data, error } = await supabase
+      .from('student_boarding')
+      .insert({
+        route_progress_id,
+        student_name,
+        stop_id,
+        action,
+        notes,
+        created_by: req.user.id
+      })
+      .select(`
+        *,
+        stop:stops(name, stop_order)
+      `)
+      .single();
+
+    if (error) {
+      logger.error('Failed to record student boarding', { error });
+      return res.status(500).json({ error: 'Failed to record student boarding' });
+    }
+
+    // Update total students onboard
+    const { data: currentProgress } = await supabase
+      .from('route_progress')
+      .select('total_students_onboard')
+      .eq('id', route_progress_id)
+      .single();
+
+    const currentCount = currentProgress?.total_students_onboard || 0;
+    const newCount = action === 'board' ? currentCount + 1 : Math.max(0, currentCount - 1);
+
+    await supabase
+      .from('route_progress')
+      .update({ total_students_onboard: newCount })
+      .eq('id', route_progress_id);
+
+    logger.info('Student boarding recorded', { 
+      routeProgressId: route_progress_id,
+      studentName: student_name,
+      action,
+      userId: req.user.id 
+    });
+
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Record student boarding error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Complete a route
+router.put('/route-progress/:id/complete', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { final_location } = req.body;
+
+    const { data, error } = await supabase
+      .from('route_progress')
+      .update({
+        status: 'completed',
+        actual_end_time: new Date().toISOString(),
+        current_location: final_location || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to complete route', { error });
+      return res.status(500).json({ error: 'Failed to complete route' });
+    }
+
+    logger.info('Route completed', { 
+      routeProgressId: id,
+      userId: req.user.id 
+    });
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Complete route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get predefined locations
+router.get('/predefined-locations', authenticateToken, async (req, res) => {
+  try {
+    const { category, is_active = true } = req.query;
+
+    let query = supabase
+      .from('predefined_locations')
+      .select('*')
+      .eq('is_active', is_active)
+      .order('category', { ascending: true })
+      .order('name', { ascending: true });
+
+    if (category) {
+      query = query.eq('category', category);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to fetch predefined locations', { error });
+      return res.status(500).json({ error: 'Failed to fetch predefined locations' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Get predefined locations error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create predefined location (Admin only)
+router.post('/predefined-locations', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { name, category, address, latitude, longitude, description } = req.body;
+
+    if (!name || !category || !address || !latitude || !longitude) {
+      return res.status(400).json({ error: 'Name, category, address, latitude, and longitude are required' });
+    }
+
+    const { data, error } = await supabase
+      .from('predefined_locations')
+      .insert({
+        name,
+        category,
+        address,
+        latitude,
+        longitude,
+        description
+      })
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to create predefined location', { error });
+      return res.status(500).json({ error: 'Failed to create predefined location' });
+    }
+
+    logger.info('Predefined location created', { 
+      locationId: data.id,
+      name,
+      userId: req.user.id 
+    });
+
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Create predefined location error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
