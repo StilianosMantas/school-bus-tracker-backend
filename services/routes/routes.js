@@ -24,7 +24,8 @@ const stopSchema = Joi.object({
   latitude: Joi.number().min(-90).max(90).required(),
   longitude: Joi.number().min(-180).max(180).required(),
   stop_order: Joi.number().integer().min(1).required(),
-  scheduled_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$/).required()
+  scheduled_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$/).required(),
+  notes: Joi.string().max(500).allow(null, '').optional()
 });
 
 const scheduleSchema = Joi.object({
@@ -536,7 +537,7 @@ router.put('/:routeId/stops/:stopId', authenticateToken, authorizeRoles(['admin'
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['name', 'address', 'latitude', 'longitude', 'stop_order', 'scheduled_time'];
+    const allowedFields = ['name', 'address', 'latitude', 'longitude', 'stop_order', 'scheduled_time', 'notes'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
