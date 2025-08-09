@@ -9,7 +9,7 @@ const path = require('path');
 dotenv.config({ path: path.join(__dirname, '../../.env') });
 
 const app = express();
-const PORT = process.env.GATEWAY_PORT || 3000;
+const PORT = process.env.PORT || process.env.GATEWAY_PORT || 3000;
 
 // Middleware
 app.use(helmet());
