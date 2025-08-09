@@ -12,6 +12,7 @@ const routeSchema = Joi.object({
   name: Joi.string().min(3).max(100).required(),
   description: Joi.string().max(500).optional(),
   type: Joi.string().valid('regular', 'field_trip', 'special').default('regular'),
+  route_direction: Joi.string().valid('pickup', 'dropoff', 'circular').default('pickup'),
   is_active: Joi.boolean().default(true),
   driver_id: Joi.string().uuid().allow(null).optional(),
   bus_id: Joi.string().uuid().allow(null).optional()
