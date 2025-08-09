@@ -10,7 +10,7 @@ const logger = createServiceLogger('routes-service');
 // Validation schemas
 const routeSchema = Joi.object({
   name: Joi.string().min(3).max(100).required(),
-  description: Joi.string().max(500).optional(),
+  description: Joi.string().max(500).allow(null, '').optional(),
   type: Joi.string().valid('regular', 'field_trip', 'special').default('regular'),
   route_direction: Joi.string().valid('pickup', 'dropoff', 'circular').default('pickup'),
   is_active: Joi.boolean().default(true),
