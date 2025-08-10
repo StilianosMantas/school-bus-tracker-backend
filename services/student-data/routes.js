@@ -346,6 +346,103 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
   }
 });
 
+// Get all students assigned to a specific route (Admin only)
+router.get('/route/:routeId', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { routeId } = req.params;
+
+    // Get students assigned to any stop in this route
+    const { data, error } = await supabase
+      .from('students')
+      .select(`
+        id,
+        name,
+        grade,
+        address,
+        medical_info,
+        emergency_contact,
+        emergency_phone,
+        is_active,
+        parent:profiles!parent_id(id, full_name, phone),
+        stop:stops!stop_id(id, name, route_id)
+      `)
+      .eq('stops.route_id', routeId)
+      .eq('is_active', true)
+      .order('name');
+
+    if (error) {
+      logger.error('Failed to fetch students for route', { error, routeId });
+      return res.status(500).json({ error: 'Failed to fetch students for route' });
+    }
+
+    // Also get students from student_stops table (many-to-many relationship)
+    const { data: stopStudents, error: stopError } = await supabase
+      .from('student_stops')
+      .select(`
+        student:students(
+          id,
+          name,
+          grade,
+          address,
+          medical_info,
+          emergency_contact,
+          emergency_phone,
+          is_active,
+          parent:profiles!parent_id(id, full_name, phone)
+        ),
+        stop:stops(id, name, route_id)
+      `)
+      .eq('stops.route_id', routeId)
+      .eq('is_active', true);
+
+    if (stopError) {
+      logger.error('Failed to fetch students from student_stops for route', { error: stopError, routeId });
+    }
+
+    // Combine and deduplicate students
+    const allStudents = [...(data || [])];
+    if (stopStudents) {
+      stopStudents.forEach(ss => {
+        if (ss.student && !allStudents.find(s => s.id === ss.student.id)) {
+          allStudents.push({
+            ...ss.student,
+            stop: ss.stop
+          });
+        }
+      });
+    }
+
+    // Format student data for frontend
+    const formattedStudents = allStudents.map(student => ({
+      id: student.id,
+      name: student.name,
+      full_name: student.name, // For compatibility
+      grade: student.grade,
+      address: student.address,
+      medical_info: student.medical_info,
+      emergency_contact: student.emergency_contact,
+      emergency_phone: student.emergency_phone,
+      is_active: student.is_active,
+      parent_name: student.parent?.full_name || '',
+      parent_phone: student.parent?.phone || '',
+      stop_name: student.stop?.name || '',
+      age: null // Calculate age if needed
+    }));
+
+    logger.info('Students fetched for route', { 
+      routeId, 
+      count: formattedStudents.length,
+      userId: req.user.id 
+    });
+
+    res.json({ data: formattedStudents });
+
+  } catch (error) {
+    logger.error('Get route students error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get students for a specific route and stop (Driver/Admin only)
 router.get('/route/:routeId/stop/:stopId', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
   try {
