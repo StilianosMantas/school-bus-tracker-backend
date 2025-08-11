@@ -28,6 +28,15 @@ const stopSchema = Joi.object({
   notes: Joi.string().max(500).allow(null, '').optional()
 });
 
+const locationSchema = Joi.object({
+  name: Joi.string().min(2).max(200).required(),
+  type: Joi.string().valid('school', 'depot', 'maintenance', 'parking', 'other').required(),
+  address: Joi.string().max(500).allow(null, '').optional(),
+  latitude: Joi.number().min(-90).max(90).required(),
+  longitude: Joi.number().min(-180).max(180).required(),
+  is_active: Joi.boolean().default(true)
+});
+
 const scheduleSchema = Joi.object({
   route_id: Joi.string().uuid().required(),
   bus_id: Joi.string().uuid().required(),
@@ -1075,21 +1084,39 @@ router.get('/:routeId/available-students', authenticateToken, authorizeRoles(['a
 router.post('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
   try {
     const { routeId } = req.params;
-    const { student_ids, stop_id } = req.body;
+    const { student_ids, stop_id, address_id, route_type = 'regular' } = req.body;
 
     if (!student_ids || !Array.isArray(student_ids) || student_ids.length === 0) {
       return res.status(400).json({ error: 'Student IDs array is required' });
     }
 
-    if (!stop_id) {
-      return res.status(400).json({ error: 'Stop ID is required' });
+    // Stop ID is now optional - if not provided, assign to first available stop
+    let targetStopId = stop_id;
+    
+    if (!targetStopId) {
+      // Get the first stop in this route as default
+      const { data: firstStop } = await supabase
+        .from('stops')
+        .select('id')
+        .eq('route_id', routeId)
+        .order('stop_order')
+        .limit(1)
+        .single();
+      
+      if (!firstStop) {
+        return res.status(400).json({ 
+          error: 'No stops found in this route. Please add stops before assigning students.' 
+        });
+      }
+      
+      targetStopId = firstStop.id;
     }
 
     // Verify route and stop exist
     const { data: stop, error: stopError } = await supabase
       .from('stops')
       .select('id, route_id')
-      .eq('id', stop_id)
+      .eq('id', targetStopId)
       .eq('route_id', routeId)
       .single();
 
@@ -1108,11 +1135,31 @@ router.post('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'd
       return res.status(400).json({ error: 'One or more students not found or inactive' });
     }
 
+    // Validate address_id if provided
+    if (address_id) {
+      const { data: address, error: addressError } = await supabase
+        .from('student_addresses')
+        .select('id, student_id')
+        .eq('id', address_id)
+        .eq('is_active', true)
+        .single();
+
+      if (addressError || !address) {
+        return res.status(400).json({ error: 'Invalid address ID provided' });
+      }
+
+      // Verify the address belongs to one of the students being assigned
+      if (!student_ids.includes(address.student_id)) {
+        return res.status(400).json({ error: 'Address does not belong to any of the students being assigned' });
+      }
+    }
+
     // Create assignments
     const assignments = student_ids.map(student_id => ({
       student_id,
-      stop_id,
-      route_type: 'regular',
+      stop_id: targetStopId,
+      route_type: route_type,
+      address_id: address_id || null,
       is_active: true
     }));
 
@@ -1135,14 +1182,132 @@ router.post('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'd
 
     logger.info('Students assigned to route', { 
       routeId, 
-      stopId: stop_id,
+      stopId: targetStopId,
       studentCount: student_ids.length,
+      wasStopProvided: !!stop_id,
       userId: req.user.id 
     });
 
     res.status(201).json({ data });
   } catch (error) {
     logger.error('Assign students to route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Advanced student assignment with address selection (Admin only)
+router.post('/:routeId/students/address-based', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { routeId } = req.params;
+    const { assignments } = req.body; // Array of {student_id, address_id, stop_id?, route_type?}
+
+    if (!assignments || !Array.isArray(assignments) || assignments.length === 0) {
+      return res.status(400).json({ error: 'Assignments array is required' });
+    }
+
+    // Validate all assignments
+    for (const assignment of assignments) {
+      if (!assignment.student_id || !assignment.address_id) {
+        return res.status(400).json({ error: 'Each assignment must have student_id and address_id' });
+      }
+
+      // Verify student exists and is active
+      const { data: student, error: studentError } = await supabase
+        .from('students')
+        .select('id, name')
+        .eq('id', assignment.student_id)
+        .eq('is_active', true)
+        .single();
+
+      if (studentError || !student) {
+        return res.status(400).json({ error: `Student ${assignment.student_id} not found or inactive` });
+      }
+
+      // Verify address exists, is active, and belongs to the student
+      const { data: address, error: addressError } = await supabase
+        .from('student_addresses')
+        .select('id, student_id, address_type, is_pickup_address, is_dropoff_address')
+        .eq('id', assignment.address_id)
+        .eq('student_id', assignment.student_id)
+        .eq('is_active', true)
+        .single();
+
+      if (addressError || !address) {
+        return res.status(400).json({ 
+          error: `Address ${assignment.address_id} not found or does not belong to student ${assignment.student_id}` 
+        });
+      }
+
+      // Check if address is suitable for the route type
+      const routeType = assignment.route_type || 'regular';
+      const isPickupRoute = routeType === 'pickup' || routeType === 'regular';
+      const isDropoffRoute = routeType === 'dropoff' || routeType === 'regular';
+
+      if (isPickupRoute && !address.is_pickup_address) {
+        return res.status(400).json({ 
+          error: `Address ${assignment.address_id} is not configured for pickup routes` 
+        });
+      }
+
+      if (isDropoffRoute && !address.is_dropoff_address) {
+        return res.status(400).json({ 
+          error: `Address ${assignment.address_id} is not configured for dropoff routes` 
+        });
+      }
+    }
+
+    // If no stop_id provided for assignments, find the most appropriate stop based on address proximity
+    // For now, we'll use the first stop as default (future enhancement: geocoding-based stop selection)
+    const { data: defaultStop } = await supabase
+      .from('stops')
+      .select('id')
+      .eq('route_id', routeId)
+      .order('stop_order')
+      .limit(1)
+      .single();
+
+    if (!defaultStop) {
+      return res.status(400).json({ 
+        error: 'No stops found in this route. Please add stops before assigning students.' 
+      });
+    }
+
+    // Prepare assignments for database insertion
+    const dbAssignments = assignments.map(assignment => ({
+      student_id: assignment.student_id,
+      stop_id: assignment.stop_id || defaultStop.id,
+      route_type: assignment.route_type || 'regular',
+      address_id: assignment.address_id,
+      is_active: true
+    }));
+
+    const { data, error } = await supabase
+      .from('student_stops')
+      .insert(dbAssignments)
+      .select(`
+        *,
+        student:students(id, name, grade),
+        stop:stops(id, name),
+        address:student_addresses(id, address_type, address_name, full_address)
+      `);
+
+    if (error) {
+      if (error.code === '23505') {
+        return res.status(400).json({ error: 'One or more students are already assigned to the specified stops' });
+      }
+      logger.error('Failed to assign students with addresses to route', { error, routeId });
+      return res.status(500).json({ error: 'Failed to assign students to route' });
+    }
+
+    logger.info('Students assigned to route with addresses', { 
+      routeId, 
+      assignmentCount: assignments.length,
+      userId: req.user.id 
+    });
+
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Address-based student assignment error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1217,6 +1382,155 @@ router.get('/student-counts', authenticateToken, authorizeRoles(['admin', 'dispa
     res.json({ data: counts });
   } catch (error) {
     logger.error('Get student counts error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== LOCATION MANAGEMENT ENDPOINTS ====================
+
+// Get all locations
+router.get('/locations', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { type, active_only } = req.query;
+
+    let query = supabase
+      .from('locations')
+      .select('*')
+      .order('type', { ascending: true })
+      .order('name', { ascending: true });
+
+    if (type) {
+      query = query.eq('type', type);
+    }
+
+    if (active_only === 'true') {
+      query = query.eq('is_active', true);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to fetch locations', { error });
+      return res.status(500).json({ error: 'Failed to fetch locations' });
+    }
+
+    res.json({ data: data || [] });
+  } catch (error) {
+    logger.error('Get locations error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single location
+router.get('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('locations')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+      logger.error('Failed to fetch location', { error });
+      return res.status(500).json({ error: 'Failed to fetch location' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Get location error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create location
+router.post('/locations', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { error: validationError, value } = locationSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    const { data, error } = await supabase
+      .from('locations')
+      .insert(value)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to create location', { error });
+      return res.status(500).json({ error: 'Failed to create location' });
+    }
+
+    logger.info('Location created', { locationId: data.id, userId: req.user.id });
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Create location error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update location
+router.put('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const { error: validationError, value } = locationSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    const { data, error } = await supabase
+      .from('locations')
+      .update(value)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+      logger.error('Failed to update location', { error });
+      return res.status(500).json({ error: 'Failed to update location' });
+    }
+
+    logger.info('Location updated', { locationId: id, userId: req.user.id });
+    res.json({ data });
+  } catch (error) {
+    logger.error('Update location error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete location
+router.delete('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('locations')
+      .delete()
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+      logger.error('Failed to delete location', { error });
+      return res.status(500).json({ error: 'Failed to delete location' });
+    }
+
+    logger.info('Location deleted', { locationId: id, userId: req.user.id });
+    res.json({ data, message: 'Location deleted successfully' });
+  } catch (error) {
+    logger.error('Delete location error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

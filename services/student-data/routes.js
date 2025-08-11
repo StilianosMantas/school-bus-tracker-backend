@@ -36,11 +36,32 @@ const studentSchema = Joi.object({
   medical_info: Joi.string().max(500).allow('', null),
   emergency_contact: Joi.string().max(100).allow('', null),
   emergency_phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).allow('', null),
+  external_student_id: Joi.string().max(100).allow('', null).optional(),
   parent_email: Joi.string().email().required(),
   parent_name: Joi.string().min(2).max(100).required(),
   parent_phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).required(),
   stop_id: Joi.string().uuid().allow(null).optional(),
   is_active: Joi.boolean().default(true)
+});
+
+// Student address validation schema
+const studentAddressSchema = Joi.object({
+  address_type: Joi.string().valid('primary', 'secondary', 'weekend', 'alternate', 'emergency').required(),
+  address_name: Joi.string().max(100).allow('', null).optional(),
+  street_name: Joi.string().max(200).required(),
+  street_number: Joi.string().max(20).required(),
+  postal_code: Joi.string().max(10).allow('', null).optional(),
+  city: Joi.string().max(100).default('Αθήνα'),
+  full_address: Joi.string().allow('', null).optional(),
+  latitude: Joi.number().min(-90).max(90).allow(null).optional(),
+  longitude: Joi.number().min(-180).max(180).allow(null).optional(),
+  notes: Joi.string().allow('', null).optional(),
+  is_active: Joi.boolean().default(true),
+  is_pickup_address: Joi.boolean().default(true),
+  is_dropoff_address: Joi.boolean().default(true),
+  contact_person: Joi.string().max(100).allow('', null).optional(),
+  contact_phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).allow('', null).optional(),
+  priority_order: Joi.number().integer().min(0).default(0)
 });
 
 // Health check
@@ -62,7 +83,8 @@ router.get('/', authenticateToken, authorizeRoles(['admin']), async (req, res) =
       .select(`
         *,
         parent:profiles!parent_id(*),
-        stop:stops(*)
+        stop:stops(*),
+        addresses:student_addresses(*)
       `)
       .order('name');
 
@@ -307,7 +329,7 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['name', 'grade', 'address', 'medical_info', 'emergency_contact', 'emergency_phone', 'stop_id', 'is_active'];
+    const allowedFields = ['name', 'grade', 'address', 'medical_info', 'emergency_contact', 'emergency_phone', 'external_student_id', 'stop_id', 'is_active'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
@@ -1297,6 +1319,239 @@ router.post('/:studentId/routes/batch', authenticateToken, authorizeRoles(['admi
     res.status(201).json({ data });
   } catch (error) {
     logger.error('Batch assign routes error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== STUDENT ADDRESS MANAGEMENT ENDPOINTS ====================
+
+// Get all addresses for a student
+router.get('/:studentId/addresses', authenticateToken, authorizeRoles(['admin', 'parent']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    
+    // For parent role, verify they own this student
+    if (req.user.role === 'parent') {
+      const { data: student } = await supabase
+        .from('students')
+        .select('parent_id')
+        .eq('id', studentId)
+        .single();
+        
+      if (!student || student.parent_id !== req.user.id) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('student_addresses')
+      .select('*')
+      .eq('student_id', studentId)
+      .order('priority_order', { ascending: true });
+
+    if (error) {
+      logger.error('Failed to fetch student addresses', { error });
+      return res.status(500).json({ error: 'Failed to fetch addresses' });
+    }
+
+    res.json({ data: data || [] });
+  } catch (error) {
+    logger.error('Get student addresses error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create new address for student
+router.post('/:studentId/addresses', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    
+    const { error: validationError, value } = studentAddressSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    // Check if student exists
+    const { data: student, error: studentError } = await supabase
+      .from('students')
+      .select('id')
+      .eq('id', studentId)
+      .single();
+
+    if (studentError || !student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // If this is a primary address, deactivate other primary addresses
+    if (value.address_type === 'primary') {
+      await supabase
+        .from('student_addresses')
+        .update({ is_active: false })
+        .eq('student_id', studentId)
+        .eq('address_type', 'primary');
+    }
+
+    const { data, error } = await supabase
+      .from('student_addresses')
+      .insert({
+        ...value,
+        student_id: studentId
+      })
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to create student address', { error });
+      return res.status(500).json({ error: 'Failed to create address' });
+    }
+
+    logger.info('Student address created', { 
+      studentId, 
+      addressId: data.id, 
+      userId: req.user.id 
+    });
+    
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Create student address error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update student address
+router.put('/:studentId/addresses/:addressId', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId, addressId } = req.params;
+    
+    const { error: validationError, value } = studentAddressSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    // If this is being set as primary address, deactivate other primary addresses
+    if (value.address_type === 'primary') {
+      await supabase
+        .from('student_addresses')
+        .update({ is_active: false })
+        .eq('student_id', studentId)
+        .eq('address_type', 'primary')
+        .neq('id', addressId);
+    }
+
+    const { data, error } = await supabase
+      .from('student_addresses')
+      .update(value)
+      .eq('id', addressId)
+      .eq('student_id', studentId)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Address not found' });
+      }
+      logger.error('Failed to update student address', { error });
+      return res.status(500).json({ error: 'Failed to update address' });
+    }
+
+    logger.info('Student address updated', { 
+      studentId, 
+      addressId, 
+      userId: req.user.id 
+    });
+    
+    res.json({ data });
+  } catch (error) {
+    logger.error('Update student address error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete student address
+router.delete('/:studentId/addresses/:addressId', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId, addressId } = req.params;
+
+    // Check if this is the only primary address
+    const { data: addresses, error: checkError } = await supabase
+      .from('student_addresses')
+      .select('id, address_type')
+      .eq('student_id', studentId)
+      .eq('is_active', true);
+
+    if (checkError) {
+      logger.error('Failed to check student addresses', { error: checkError });
+      return res.status(500).json({ error: 'Failed to check addresses' });
+    }
+
+    const addressToDelete = addresses?.find(addr => addr.id === addressId);
+    const primaryAddresses = addresses?.filter(addr => addr.address_type === 'primary') || [];
+
+    if (addressToDelete?.address_type === 'primary' && primaryAddresses.length === 1) {
+      return res.status(400).json({ 
+        error: 'Δεν μπορείτε να διαγράψετε την μοναδική κύρια διεύθυνση. Προσθέστε πρώτα μια νέα κύρια διεύθυνση.' 
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('student_addresses')
+      .delete()
+      .eq('id', addressId)
+      .eq('student_id', studentId)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Address not found' });
+      }
+      logger.error('Failed to delete student address', { error });
+      return res.status(500).json({ error: 'Failed to delete address' });
+    }
+
+    logger.info('Student address deleted', { 
+      studentId, 
+      addressId, 
+      userId: req.user.id 
+    });
+    
+    res.json({ data, message: 'Address deleted successfully' });
+  } catch (error) {
+    logger.error('Delete student address error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Set address priority order
+router.put('/:studentId/addresses/reorder', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const { addressOrder } = req.body; // Array of {id, priority_order}
+    
+    if (!Array.isArray(addressOrder)) {
+      return res.status(400).json({ error: 'addressOrder must be an array' });
+    }
+
+    // Update priority orders
+    const updates = addressOrder.map(({ id, priority_order }) => {
+      return supabase
+        .from('student_addresses')
+        .update({ priority_order })
+        .eq('id', id)
+        .eq('student_id', studentId);
+    });
+
+    await Promise.all(updates);
+
+    logger.info('Student address order updated', { 
+      studentId, 
+      count: addressOrder.length,
+      userId: req.user.id 
+    });
+    
+    res.json({ message: 'Address order updated successfully' });
+  } catch (error) {
+    logger.error('Reorder student addresses error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
