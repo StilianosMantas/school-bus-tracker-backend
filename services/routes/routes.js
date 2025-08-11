@@ -956,4 +956,237 @@ router.put('/:id/permanent-assignment', authenticateToken, authorizeRoles(['admi
   }
 });
 
+// Get students assigned to a route (Admin only)
+router.get('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { routeId } = req.params;
+
+    // Get students assigned to any stop in this route via student_stops table
+    const { data: studentStops, error: studentStopsError } = await supabase
+      .from('student_stops')
+      .select(`
+        id,
+        student_id,
+        stop_id,
+        route_type,
+        is_active,
+        student:students(id, name, grade, address, is_active, parent:profiles!parent_id(id, full_name)),
+        stop:stops!inner(id, name, route_id)
+      `)
+      .eq('stops.route_id', routeId)
+      .eq('is_active', true)
+      .eq('students.is_active', true);
+
+    if (studentStopsError) {
+      logger.error('Failed to fetch route students', { error: studentStopsError, routeId });
+      return res.status(500).json({ error: 'Failed to fetch route students' });
+    }
+
+    // Also get students directly assigned via students.stop_id
+    const { data: directStudents, error: directError } = await supabase
+      .from('students')
+      .select(`
+        id, name, grade, address, is_active, stop_id,
+        parent:profiles!parent_id(id, full_name),
+        stop:stops!inner(id, name, route_id)
+      `)
+      .eq('stops.route_id', routeId)
+      .eq('is_active', true);
+
+    if (directError) {
+      logger.error('Failed to fetch direct route students', { error: directError, routeId });
+      return res.status(500).json({ error: 'Failed to fetch route students' });
+    }
+
+    // Combine and deduplicate students
+    const allStudents = new Map();
+    
+    // Add students from student_stops
+    studentStops?.forEach(assignment => {
+      if (assignment.student) {
+        const studentId = assignment.student.id;
+        if (!allStudents.has(studentId)) {
+          allStudents.set(studentId, {
+            ...assignment.student,
+            assignments: []
+          });
+        }
+        allStudents.get(studentId).assignments.push({
+          id: assignment.id,
+          stop_id: assignment.stop_id,
+          stop_name: assignment.stop.name,
+          route_type: assignment.route_type
+        });
+      }
+    });
+
+    // Add students with direct assignment
+    directStudents?.forEach(student => {
+      if (!allStudents.has(student.id)) {
+        allStudents.set(student.id, {
+          ...student,
+          assignments: [{
+            stop_id: student.stop_id,
+            stop_name: student.stop.name,
+            route_type: 'direct'
+          }]
+        });
+      }
+    });
+
+    const students = Array.from(allStudents.values());
+
+    res.json({ data: students });
+  } catch (error) {
+    logger.error('Get route students error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get available students for route assignment (not already assigned to this route)
+router.get('/:routeId/available-students', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { routeId } = req.params;
+
+    // Get all active students
+    const { data: allStudents, error: studentsError } = await supabase
+      .from('students')
+      .select(`
+        id, name, grade, address, is_active,
+        parent:profiles!parent_id(id, full_name, phone)
+      `)
+      .eq('is_active', true)
+      .order('name');
+
+    if (studentsError) {
+      logger.error('Failed to fetch all students', { error: studentsError });
+      return res.status(500).json({ error: 'Failed to fetch students' });
+    }
+
+    // Get students already assigned to this route
+    const { data: assignedStudents } = await supabase
+      .from('student_stops')
+      .select('student_id, stops!inner(route_id)')
+      .eq('stops.route_id', routeId)
+      .eq('is_active', true);
+
+    const assignedIds = new Set(assignedStudents?.map(a => a.student_id) || []);
+
+    // Filter out already assigned students
+    const availableStudents = allStudents?.filter(student => !assignedIds.has(student.id)) || [];
+
+    res.json({ data: availableStudents });
+  } catch (error) {
+    logger.error('Get available students error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Assign students to route (Admin only)
+router.post('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { routeId } = req.params;
+    const { student_ids, stop_id } = req.body;
+
+    if (!student_ids || !Array.isArray(student_ids) || student_ids.length === 0) {
+      return res.status(400).json({ error: 'Student IDs array is required' });
+    }
+
+    if (!stop_id) {
+      return res.status(400).json({ error: 'Stop ID is required' });
+    }
+
+    // Verify route and stop exist
+    const { data: stop, error: stopError } = await supabase
+      .from('stops')
+      .select('id, route_id')
+      .eq('id', stop_id)
+      .eq('route_id', routeId)
+      .single();
+
+    if (stopError || !stop) {
+      return res.status(404).json({ error: 'Stop not found in this route' });
+    }
+
+    // Verify all students exist and are active
+    const { data: students, error: studentsError } = await supabase
+      .from('students')
+      .select('id, name')
+      .in('id', student_ids)
+      .eq('is_active', true);
+
+    if (studentsError || students.length !== student_ids.length) {
+      return res.status(400).json({ error: 'One or more students not found or inactive' });
+    }
+
+    // Create assignments
+    const assignments = student_ids.map(student_id => ({
+      student_id,
+      stop_id,
+      route_type: 'regular',
+      is_active: true
+    }));
+
+    const { data, error } = await supabase
+      .from('student_stops')
+      .insert(assignments)
+      .select(`
+        *,
+        student:students(id, name, grade),
+        stop:stops(id, name)
+      `);
+
+    if (error) {
+      if (error.code === '23505') {
+        return res.status(400).json({ error: 'One or more students are already assigned to this stop' });
+      }
+      logger.error('Failed to assign students to route', { error, routeId });
+      return res.status(500).json({ error: 'Failed to assign students to route' });
+    }
+
+    logger.info('Students assigned to route', { 
+      routeId, 
+      stopId: stop_id,
+      studentCount: student_ids.length,
+      userId: req.user.id 
+    });
+
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Assign students to route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove student from route (Admin only)
+router.delete('/:routeId/students/:studentId', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { routeId, studentId } = req.params;
+
+    // Remove from student_stops table
+    const { error } = await supabase
+      .from('student_stops')
+      .delete()
+      .eq('student_id', studentId)
+      .in('stop_id', 
+        supabase
+          .from('stops')
+          .select('id')
+          .eq('route_id', routeId)
+      );
+
+    if (error) {
+      logger.error('Failed to remove student from route', { error, routeId, studentId });
+      return res.status(500).json({ error: 'Failed to remove student from route' });
+    }
+
+    logger.info('Student removed from route', { routeId, studentId, userId: req.user.id });
+
+    res.json({ message: 'Student removed from route successfully' });
+  } catch (error) {
+    logger.error('Remove student from route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 module.exports = router;
