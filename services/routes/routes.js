@@ -96,6 +96,155 @@ router.get('/driver/debug', authenticateToken, authorizeRoles(['driver']), async
   }
 });
 
+// ==================== LOCATION MANAGEMENT ENDPOINTS ====================
+
+// Get all locations
+router.get('/locations', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { type, active_only } = req.query;
+
+    let query = supabase
+      .from('locations')
+      .select('*')
+      .order('type', { ascending: true })
+      .order('name', { ascending: true });
+
+    if (type) {
+      query = query.eq('type', type);
+    }
+
+    if (active_only === 'true') {
+      query = query.eq('is_active', true);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to fetch locations', { error });
+      return res.status(500).json({ error: 'Failed to fetch locations' });
+    }
+
+    res.json({ data: data || [] });
+  } catch (error) {
+    logger.error('Get locations error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single location
+router.get('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('locations')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+      logger.error('Failed to fetch location', { error });
+      return res.status(500).json({ error: 'Failed to fetch location' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Get location error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create location
+router.post('/locations', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { error: validationError, value } = locationSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    const { data, error } = await supabase
+      .from('locations')
+      .insert(value)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to create location', { error });
+      return res.status(500).json({ error: 'Failed to create location' });
+    }
+
+    logger.info('Location created', { locationId: data.id, userId: req.user.id });
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Create location error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update location
+router.put('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const { error: validationError, value } = locationSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    const { data, error } = await supabase
+      .from('locations')
+      .update(value)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+      logger.error('Failed to update location', { error });
+      return res.status(500).json({ error: 'Failed to update location' });
+    }
+
+    logger.info('Location updated', { locationId: id, userId: req.user.id });
+    res.json({ data });
+  } catch (error) {
+    logger.error('Update location error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete location
+router.delete('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('locations')
+      .delete()
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Location not found' });
+      }
+      logger.error('Failed to delete location', { error });
+      return res.status(500).json({ error: 'Failed to delete location' });
+    }
+
+    logger.info('Location deleted', { locationId: id, userId: req.user.id });
+    res.json({ data, message: 'Location deleted successfully' });
+  } catch (error) {
+    logger.error('Delete location error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get all drivers for assignment (Admin only)
 router.get('/drivers', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
   try {
@@ -306,6 +455,326 @@ router.delete('/schedule-exceptions/:id', authenticateToken, authorizeRoles(['ad
     res.json({ message: 'Schedule exception deleted successfully' });
   } catch (error) {
     logger.error('Delete schedule exception error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get driver's schedules (MUST be before /:id route to avoid conflict)
+router.get('/driver/schedules', authenticateToken, async (req, res) => {
+  try {
+    logger.error('ROUTE HIT: /driver/schedules - before any processing', {
+      headers: req.headers.authorization ? 'Bearer token present' : 'No auth header',
+      user: req.user ? 'User object exists' : 'No user object'
+    });
+    const { date } = req.query;
+    const targetDate = date || new Date().toISOString().split('T')[0];
+    
+    logger.error('DEBUG - Full req.user object', { 
+      fullUser: req.user,
+      userKeys: Object.keys(req.user || {}),
+      userId: req.user?.id,
+      userIdType: typeof req.user?.id,
+      userIdValue: JSON.stringify(req.user?.id)
+    });
+
+    // Check if user ID is literally the string "driver"
+    if (req.user.id === 'driver') {
+      logger.error('User ID is literally the string "driver" - authentication problem');
+      return res.status(401).json({ error: 'Authentication error - invalid user ID' });
+    }
+
+    // First, let's try the simple case - just return empty array for now to test auth
+    if (!req.user.id || typeof req.user.id !== 'string' || req.user.id.length < 10) {
+      logger.error('Invalid driver ID', { userId: req.user.id, type: typeof req.user.id });
+      return res.status(400).json({ error: 'Invalid driver ID' });
+    }
+
+    // Try to fetch routes assigned to this driver (permanent assignments)  
+    // First try permanent assignments
+    const { data: permanentRoutes } = await supabase
+      .from('routes')
+      .select(`
+        id,
+        name,
+        type,
+        is_active,
+        permanent_driver_id,
+        driver_id,
+        permanent_bus_id,
+        bus_id,
+        default_start_time,
+        default_end_time
+      `)
+      .eq('is_active', true)
+      .eq('permanent_driver_id', req.user.id);
+
+    // Then try regular assignments  
+    const { data: regularRoutes } = await supabase
+      .from('routes')
+      .select(`
+        id,
+        name,
+        type,
+        is_active,
+        permanent_driver_id,
+        driver_id,
+        permanent_bus_id,
+        bus_id,
+        default_start_time,
+        default_end_time
+      `)
+      .eq('is_active', true)
+      .eq('driver_id', req.user.id);
+
+    // Combine results and remove duplicates
+    const allRoutes = [...(permanentRoutes || []), ...(regularRoutes || [])];
+    const routes = allRoutes.filter((route, index, self) => 
+      index === self.findIndex(r => r.id === route.id)
+    );
+    
+    const routesError = null; // No error from individual queries
+
+    if (routesError) {
+      logger.error('Error fetching driver routes', { 
+        error: routesError, 
+        driverId: req.user.id,
+        query: `permanent_driver_id.eq.${req.user.id},driver_id.eq.${req.user.id}`
+      });
+      return res.status(500).json({ error: 'Failed to fetch schedules' });
+    }
+
+    if (!routes || routes.length === 0) {
+      logger.info('No routes found for driver', { driverId: req.user.id });
+      return res.json({ data: [] });
+    }
+
+    // Transform routes into schedule format
+    const schedules = [];
+    for (const route of routes) {
+      try {
+        // Get bus info if available
+        let busData = null;
+        const busId = route.permanent_bus_id || route.bus_id;
+        if (busId) {
+          const { data: bus } = await supabase
+            .from('buses')
+            .select('id, bus_number, capacity, status')
+            .eq('id', busId)
+            .single();
+          busData = bus;
+        }
+
+        // Get stops for the route
+        const { data: stops } = await supabase
+          .from('stops')
+          .select('*')
+          .eq('route_id', route.id)
+          .order('stop_order');
+
+        // Check if there's an existing schedule record for today
+        const { data: existingSchedule } = await supabase
+          .from('schedules')
+          .select('id, status, start_time, end_time')
+          .eq('route_id', route.id)
+          .eq('driver_id', req.user.id)
+          .eq('date', targetDate)
+          .single();
+
+        // Use existing schedule data if available, otherwise create synthetic schedule
+        const scheduleData = {
+          id: existingSchedule ? existingSchedule.id : `${route.id}_${targetDate}`,
+          route_id: route.id,
+          bus_id: busId,
+          driver_id: req.user.id,
+          date: targetDate,
+          start_time: existingSchedule?.start_time || route.default_start_time || '08:00:00',
+          end_time: existingSchedule?.end_time || route.default_end_time || '16:00:00',
+          status: existingSchedule?.status || 'scheduled',
+          routes: {
+            id: route.id,
+            name: route.name,
+            type: route.type,
+            stops: stops || []
+          },
+          buses: busData || {
+            bus_number: 'N/A',
+            capacity: 0
+          }
+        };
+
+        schedules.push(scheduleData);
+      } catch (scheduleError) {
+        logger.warn('Error processing route for schedule', { 
+          routeId: route.id, 
+          error: scheduleError.message 
+        });
+      }
+    }
+
+    logger.info('Returning schedules', { count: schedules.length, driverId: req.user.id });
+    res.json({ data: schedules });
+
+  } catch (error) {
+    logger.error('Get driver schedules error', { 
+      error: error.message, 
+      stack: error.stack,
+      driverId: req.user?.id 
+    });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create schedule (Admin/Dispatcher only)
+router.post('/schedule', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { error: validationError, value } = scheduleSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    // Check for conflicts
+    const { data: existingSchedule } = await supabase
+      .from('schedules')
+      .select('id')
+      .eq('date', value.date)
+      .or(`bus_id.eq.${value.bus_id},driver_id.eq.${value.driver_id}`)
+      .eq('status', 'scheduled')
+      .single();
+
+    if (existingSchedule) {
+      return res.status(400).json({ 
+        error: 'Bus or driver already scheduled for this date' 
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('schedules')
+      .insert({
+        ...value,
+        status: 'scheduled'
+      })
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to create schedule', { error });
+      return res.status(500).json({ error: 'Failed to create schedule' });
+    }
+
+    logger.info('Schedule created', { 
+      scheduleId: data.id, 
+      userId: req.user.id 
+    });
+
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Create schedule error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Check for scheduling conflicts
+router.post('/schedules/check-conflicts', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { bus_id, driver_id, date, start_time, end_time, exclude_schedule_id } = req.body;
+
+    const conflicts = [];
+
+    if (bus_id) {
+      let query = supabase
+        .from('schedules')
+        .select('*, routes(name)')
+        .eq('bus_id', bus_id)
+        .eq('date', date)
+        .in('status', ['scheduled', 'in_progress'])
+        .or(`and(start_time.lte.${end_time},end_time.gte.${start_time})`);
+
+      if (exclude_schedule_id) {
+        query = query.neq('id', exclude_schedule_id);
+      }
+
+      const { data: busConflicts } = await query;
+      
+      if (busConflicts && busConflicts.length > 0) {
+        conflicts.push({
+          type: 'bus',
+          conflicts: busConflicts
+        });
+      }
+    }
+
+    if (driver_id) {
+      let query = supabase
+        .from('schedules')
+        .select('*, routes(name)')
+        .eq('driver_id', driver_id)
+        .eq('date', date)
+        .in('status', ['scheduled', 'in_progress'])
+        .or(`and(start_time.lte.${end_time},end_time.gte.${start_time})`);
+
+      if (exclude_schedule_id) {
+        query = query.neq('id', exclude_schedule_id);
+      }
+
+      const { data: driverConflicts } = await query;
+      
+      if (driverConflicts && driverConflicts.length > 0) {
+        conflicts.push({
+          type: 'driver',
+          conflicts: driverConflicts
+        });
+      }
+    }
+
+    res.json({ 
+      has_conflicts: conflicts.length > 0,
+      conflicts 
+    });
+  } catch (error) {
+    logger.error('Check conflicts error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get student counts for all routes (batch endpoint for performance)
+router.get('/student-counts', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    // Single optimized query to get student counts for all routes
+    const { data: studentCounts, error } = await supabase
+      .from('student_stops')
+      .select(`
+        student_id,
+        stops(route_id),
+        students(is_active)
+      `)
+      .eq('is_active', true)
+      .eq('students.is_active', true);
+
+    if (error) {
+      logger.error('Failed to fetch student counts', { error });
+      return res.status(500).json({ error: 'Failed to fetch student counts' });
+    }
+
+    // Count unique students per route
+    const routeStudentCounts = new Map();
+    
+    studentCounts?.forEach(assignment => {
+      const routeId = assignment.stops.route_id;
+      if (!routeStudentCounts.has(routeId)) {
+        routeStudentCounts.set(routeId, new Set());
+      }
+      routeStudentCounts.get(routeId).add(assignment.student_id);
+    });
+
+    // Convert to object with route_id -> count
+    const counts = {};
+    routeStudentCounts.forEach((studentIds, routeId) => {
+      counts[routeId] = studentIds.size;
+    });
+
+    res.json({ data: counts });
+  } catch (error) {
+    logger.error('Get student counts error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -607,170 +1076,6 @@ router.delete('/:routeId/stops/:stopId', authenticateToken, authorizeRoles(['adm
   }
 });
 
-// Get driver's schedules (MUST be before /:routeId/schedules to avoid conflict)
-router.get('/driver/schedules', authenticateToken, async (req, res) => {
-  try {
-    logger.error('ROUTE HIT: /driver/schedules - before any processing', {
-      headers: req.headers.authorization ? 'Bearer token present' : 'No auth header',
-      user: req.user ? 'User object exists' : 'No user object'
-    });
-    const { date } = req.query;
-    const targetDate = date || new Date().toISOString().split('T')[0];
-    
-    logger.error('DEBUG - Full req.user object', { 
-      fullUser: req.user,
-      userKeys: Object.keys(req.user || {}),
-      userId: req.user?.id,
-      userIdType: typeof req.user?.id,
-      userIdValue: JSON.stringify(req.user?.id)
-    });
-
-    // Check if user ID is literally the string "driver"
-    if (req.user.id === 'driver') {
-      logger.error('User ID is literally the string "driver" - authentication problem');
-      return res.status(401).json({ error: 'Authentication error - invalid user ID' });
-    }
-
-    // First, let's try the simple case - just return empty array for now to test auth
-    if (!req.user.id || typeof req.user.id !== 'string' || req.user.id.length < 10) {
-      logger.error('Invalid driver ID', { userId: req.user.id, type: typeof req.user.id });
-      return res.status(400).json({ error: 'Invalid driver ID' });
-    }
-
-    // Try to fetch routes assigned to this driver (permanent assignments)  
-    // First try permanent assignments
-    const { data: permanentRoutes } = await supabase
-      .from('routes')
-      .select(`
-        id,
-        name,
-        type,
-        is_active,
-        permanent_driver_id,
-        driver_id,
-        permanent_bus_id,
-        bus_id,
-        default_start_time,
-        default_end_time
-      `)
-      .eq('is_active', true)
-      .eq('permanent_driver_id', req.user.id);
-
-    // Then try regular assignments  
-    const { data: regularRoutes } = await supabase
-      .from('routes')
-      .select(`
-        id,
-        name,
-        type,
-        is_active,
-        permanent_driver_id,
-        driver_id,
-        permanent_bus_id,
-        bus_id,
-        default_start_time,
-        default_end_time
-      `)
-      .eq('is_active', true)
-      .eq('driver_id', req.user.id);
-
-    // Combine results and remove duplicates
-    const allRoutes = [...(permanentRoutes || []), ...(regularRoutes || [])];
-    const routes = allRoutes.filter((route, index, self) => 
-      index === self.findIndex(r => r.id === route.id)
-    );
-    
-    const routesError = null; // No error from individual queries
-
-    if (routesError) {
-      logger.error('Error fetching driver routes', { 
-        error: routesError, 
-        driverId: req.user.id,
-        query: `permanent_driver_id.eq.${req.user.id},driver_id.eq.${req.user.id}`
-      });
-      return res.status(500).json({ error: 'Failed to fetch schedules' });
-    }
-
-    if (!routes || routes.length === 0) {
-      logger.info('No routes found for driver', { driverId: req.user.id });
-      return res.json({ data: [] });
-    }
-
-    // Transform routes into schedule format
-    const schedules = [];
-    for (const route of routes) {
-      try {
-        // Get bus info if available
-        let busData = null;
-        const busId = route.permanent_bus_id || route.bus_id;
-        if (busId) {
-          const { data: bus } = await supabase
-            .from('buses')
-            .select('id, bus_number, capacity, status')
-            .eq('id', busId)
-            .single();
-          busData = bus;
-        }
-
-        // Get stops for the route
-        const { data: stops } = await supabase
-          .from('stops')
-          .select('*')
-          .eq('route_id', route.id)
-          .order('stop_order');
-
-        // Check if there's an existing schedule record for today
-        const { data: existingSchedule } = await supabase
-          .from('schedules')
-          .select('id, status, start_time, end_time')
-          .eq('route_id', route.id)
-          .eq('driver_id', req.user.id)
-          .eq('date', targetDate)
-          .single();
-
-        // Use existing schedule data if available, otherwise create synthetic schedule
-        const scheduleData = {
-          id: existingSchedule ? existingSchedule.id : `${route.id}_${targetDate}`,
-          route_id: route.id,
-          bus_id: busId,
-          driver_id: req.user.id,
-          date: targetDate,
-          start_time: existingSchedule?.start_time || route.default_start_time || '08:00:00',
-          end_time: existingSchedule?.end_time || route.default_end_time || '16:00:00',
-          status: existingSchedule?.status || 'scheduled',
-          routes: {
-            id: route.id,
-            name: route.name,
-            type: route.type,
-            stops: stops || []
-          },
-          buses: busData || {
-            bus_number: 'N/A',
-            capacity: 0
-          }
-        };
-
-        schedules.push(scheduleData);
-      } catch (scheduleError) {
-        logger.warn('Error processing route for schedule', { 
-          routeId: route.id, 
-          error: scheduleError.message 
-        });
-      }
-    }
-
-    logger.info('Returning schedules', { count: schedules.length, driverId: req.user.id });
-    res.json({ data: schedules });
-
-  } catch (error) {
-    logger.error('Get driver schedules error', { 
-      error: error.message, 
-      stack: error.stack,
-      driverId: req.user?.id 
-    });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 // Get schedules for a route
 router.get('/:routeId/schedules', authenticateToken, async (req, res) => {
@@ -809,118 +1114,6 @@ router.get('/:routeId/schedules', authenticateToken, async (req, res) => {
   }
 });
 
-// Create schedule (Admin/Dispatcher only)
-router.post('/schedule', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
-  try {
-    const { error: validationError, value } = scheduleSchema.validate(req.body);
-    if (validationError) {
-      return res.status(400).json({ error: validationError.details[0].message });
-    }
-
-    // Check for conflicts
-    const { data: existingSchedule } = await supabase
-      .from('schedules')
-      .select('id')
-      .eq('date', value.date)
-      .or(`bus_id.eq.${value.bus_id},driver_id.eq.${value.driver_id}`)
-      .eq('status', 'scheduled')
-      .single();
-
-    if (existingSchedule) {
-      return res.status(400).json({ 
-        error: 'Bus or driver already scheduled for this date' 
-      });
-    }
-
-    const { data, error } = await supabase
-      .from('schedules')
-      .insert({
-        ...value,
-        status: 'scheduled'
-      })
-      .select()
-      .single();
-
-    if (error) {
-      logger.error('Failed to create schedule', { error });
-      return res.status(500).json({ error: 'Failed to create schedule' });
-    }
-
-    logger.info('Schedule created', { 
-      scheduleId: data.id, 
-      userId: req.user.id 
-    });
-
-    res.status(201).json({ data });
-  } catch (error) {
-    logger.error('Create schedule error', { error: error.message });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-
-// Check for scheduling conflicts
-router.post('/schedules/check-conflicts', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
-  try {
-    const { bus_id, driver_id, date, start_time, end_time, exclude_schedule_id } = req.body;
-
-    const conflicts = [];
-
-    if (bus_id) {
-      let query = supabase
-        .from('schedules')
-        .select('*, routes(name)')
-        .eq('bus_id', bus_id)
-        .eq('date', date)
-        .in('status', ['scheduled', 'in_progress'])
-        .or(`and(start_time.lte.${end_time},end_time.gte.${start_time})`);
-
-      if (exclude_schedule_id) {
-        query = query.neq('id', exclude_schedule_id);
-      }
-
-      const { data: busConflicts } = await query;
-      
-      if (busConflicts && busConflicts.length > 0) {
-        conflicts.push({
-          type: 'bus',
-          conflicts: busConflicts
-        });
-      }
-    }
-
-    if (driver_id) {
-      let query = supabase
-        .from('schedules')
-        .select('*, routes(name)')
-        .eq('driver_id', driver_id)
-        .eq('date', date)
-        .in('status', ['scheduled', 'in_progress'])
-        .or(`and(start_time.lte.${end_time},end_time.gte.${start_time})`);
-
-      if (exclude_schedule_id) {
-        query = query.neq('id', exclude_schedule_id);
-      }
-
-      const { data: driverConflicts } = await query;
-      
-      if (driverConflicts && driverConflicts.length > 0) {
-        conflicts.push({
-          type: 'driver',
-          conflicts: driverConflicts
-        });
-      }
-    }
-
-    res.json({ 
-      has_conflicts: conflicts.length > 0,
-      conflicts 
-    });
-  } catch (error) {
-    logger.error('Check conflicts error', { error: error.message });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 // Update permanent route assignments
 router.put('/:id/permanent-assignment', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
@@ -1343,196 +1536,5 @@ router.delete('/:routeId/students/:studentId', authenticateToken, authorizeRoles
   }
 });
 
-// Get student counts for all routes (batch endpoint for performance)
-router.get('/student-counts', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
-  try {
-    // Single optimized query to get student counts for all routes
-    const { data: studentCounts, error } = await supabase
-      .from('student_stops')
-      .select(`
-        student_id,
-        stops(route_id),
-        students(is_active)
-      `)
-      .eq('is_active', true)
-      .eq('students.is_active', true);
-
-    if (error) {
-      logger.error('Failed to fetch student counts', { error });
-      return res.status(500).json({ error: 'Failed to fetch student counts' });
-    }
-
-    // Count unique students per route
-    const routeStudentCounts = new Map();
-    
-    studentCounts?.forEach(assignment => {
-      const routeId = assignment.stops.route_id;
-      if (!routeStudentCounts.has(routeId)) {
-        routeStudentCounts.set(routeId, new Set());
-      }
-      routeStudentCounts.get(routeId).add(assignment.student_id);
-    });
-
-    // Convert to object with route_id -> count
-    const counts = {};
-    routeStudentCounts.forEach((studentIds, routeId) => {
-      counts[routeId] = studentIds.size;
-    });
-
-    res.json({ data: counts });
-  } catch (error) {
-    logger.error('Get student counts error', { error: error.message });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ==================== LOCATION MANAGEMENT ENDPOINTS ====================
-
-// Get all locations
-router.get('/locations', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
-  try {
-    const { type, active_only } = req.query;
-
-    let query = supabase
-      .from('locations')
-      .select('*')
-      .order('type', { ascending: true })
-      .order('name', { ascending: true });
-
-    if (type) {
-      query = query.eq('type', type);
-    }
-
-    if (active_only === 'true') {
-      query = query.eq('is_active', true);
-    }
-
-    const { data, error } = await query;
-
-    if (error) {
-      logger.error('Failed to fetch locations', { error });
-      return res.status(500).json({ error: 'Failed to fetch locations' });
-    }
-
-    res.json({ data: data || [] });
-  } catch (error) {
-    logger.error('Get locations error', { error: error.message });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get single location
-router.get('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from('locations')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return res.status(404).json({ error: 'Location not found' });
-      }
-      logger.error('Failed to fetch location', { error });
-      return res.status(500).json({ error: 'Failed to fetch location' });
-    }
-
-    res.json({ data });
-  } catch (error) {
-    logger.error('Get location error', { error: error.message });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Create location
-router.post('/locations', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
-  try {
-    const { error: validationError, value } = locationSchema.validate(req.body);
-    if (validationError) {
-      return res.status(400).json({ error: validationError.details[0].message });
-    }
-
-    const { data, error } = await supabase
-      .from('locations')
-      .insert(value)
-      .select()
-      .single();
-
-    if (error) {
-      logger.error('Failed to create location', { error });
-      return res.status(500).json({ error: 'Failed to create location' });
-    }
-
-    logger.info('Location created', { locationId: data.id, userId: req.user.id });
-    res.status(201).json({ data });
-  } catch (error) {
-    logger.error('Create location error', { error: error.message });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update location
-router.put('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    const { error: validationError, value } = locationSchema.validate(req.body);
-    if (validationError) {
-      return res.status(400).json({ error: validationError.details[0].message });
-    }
-
-    const { data, error } = await supabase
-      .from('locations')
-      .update(value)
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return res.status(404).json({ error: 'Location not found' });
-      }
-      logger.error('Failed to update location', { error });
-      return res.status(500).json({ error: 'Failed to update location' });
-    }
-
-    logger.info('Location updated', { locationId: id, userId: req.user.id });
-    res.json({ data });
-  } catch (error) {
-    logger.error('Update location error', { error: error.message });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Delete location
-router.delete('/locations/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { data, error } = await supabase
-      .from('locations')
-      .delete()
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return res.status(404).json({ error: 'Location not found' });
-      }
-      logger.error('Failed to delete location', { error });
-      return res.status(500).json({ error: 'Failed to delete location' });
-    }
-
-    logger.info('Location deleted', { locationId: id, userId: req.user.id });
-    res.json({ data, message: 'Location deleted successfully' });
-  } catch (error) {
-    logger.error('Delete location error', { error: error.message });
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 module.exports = router;
