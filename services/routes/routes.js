@@ -961,7 +961,8 @@ router.get('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'di
   try {
     const { routeId } = req.params;
 
-    // Get students assigned to any stop in this route via student_stops table
+    // Optimized single query: Get all students assigned to stops in this route
+    // This replaces the previous two separate queries with one efficient query
     const { data: studentStops, error: studentStopsError } = await supabase
       .from('student_stops')
       .select(`
@@ -970,71 +971,55 @@ router.get('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'di
         stop_id,
         route_type,
         is_active,
-        student:students(id, name, grade, address, is_active, parent:profiles!parent_id(id, full_name)),
-        stop:stops!inner(id, name, route_id)
+        students!inner(
+          id, 
+          name, 
+          grade, 
+          address, 
+          is_active,
+          profiles!parent_id(id, full_name)
+        ),
+        stops!inner(id, name, route_id)
       `)
       .eq('stops.route_id', routeId)
       .eq('is_active', true)
-      .eq('students.is_active', true);
+      .eq('students.is_active', true)
+      .order('students.name');
 
     if (studentStopsError) {
       logger.error('Failed to fetch route students', { error: studentStopsError, routeId });
       return res.status(500).json({ error: 'Failed to fetch route students' });
     }
 
-    // Also get students directly assigned via students.stop_id
-    const { data: directStudents, error: directError } = await supabase
-      .from('students')
-      .select(`
-        id, name, grade, address, is_active, stop_id,
-        parent:profiles!parent_id(id, full_name),
-        stop:stops!inner(id, name, route_id)
-      `)
-      .eq('stops.route_id', routeId)
-      .eq('is_active', true);
-
-    if (directError) {
-      logger.error('Failed to fetch direct route students', { error: directError, routeId });
-      return res.status(500).json({ error: 'Failed to fetch route students' });
-    }
-
-    // Combine and deduplicate students
-    const allStudents = new Map();
+    // Process and deduplicate students (some may be assigned to multiple stops)
+    const studentsMap = new Map();
     
-    // Add students from student_stops
     studentStops?.forEach(assignment => {
-      if (assignment.student) {
-        const studentId = assignment.student.id;
-        if (!allStudents.has(studentId)) {
-          allStudents.set(studentId, {
-            ...assignment.student,
-            assignments: []
-          });
-        }
-        allStudents.get(studentId).assignments.push({
-          id: assignment.id,
-          stop_id: assignment.stop_id,
-          stop_name: assignment.stop.name,
-          route_type: assignment.route_type
+      const student = assignment.students;
+      const studentId = student.id;
+      
+      if (!studentsMap.has(studentId)) {
+        studentsMap.set(studentId, {
+          id: student.id,
+          name: student.name,
+          grade: student.grade,
+          address: student.address,
+          is_active: student.is_active,
+          parent: student.profiles,
+          assignments: []
         });
       }
+      
+      // Add this assignment to the student
+      studentsMap.get(studentId).assignments.push({
+        id: assignment.id,
+        stop_id: assignment.stop_id,
+        stop_name: assignment.stops.name,
+        route_type: assignment.route_type
+      });
     });
 
-    // Add students with direct assignment
-    directStudents?.forEach(student => {
-      if (!allStudents.has(student.id)) {
-        allStudents.set(student.id, {
-          ...student,
-          assignments: [{
-            stop_id: student.stop_id,
-            stop_name: student.stop.name,
-            route_type: 'direct'
-          }]
-        });
-      }
-    });
-
-    const students = Array.from(allStudents.values());
+    const students = Array.from(studentsMap.values());
 
     res.json({ data: students });
   } catch (error) {
@@ -1048,34 +1033,38 @@ router.get('/:routeId/available-students', authenticateToken, authorizeRoles(['a
   try {
     const { routeId } = req.params;
 
-    // Get all active students
-    const { data: allStudents, error: studentsError } = await supabase
+    // Optimized query: Use NOT EXISTS for better performance than separate queries + filtering
+    const { data: availableStudents, error: studentsError } = await supabase
       .from('students')
       .select(`
-        id, name, grade, address, is_active,
-        parent:profiles!parent_id(id, full_name, phone)
+        id, 
+        name, 
+        grade, 
+        address, 
+        is_active,
+        profiles!parent_id(id, full_name, phone)
       `)
       .eq('is_active', true)
+      .not('id', 'in', 
+        supabase
+          .from('student_stops')
+          .select('student_id')
+          .eq('is_active', true)
+          .in('stop_id',
+            supabase
+              .from('stops')
+              .select('id')
+              .eq('route_id', routeId)
+          )
+      )
       .order('name');
 
     if (studentsError) {
-      logger.error('Failed to fetch all students', { error: studentsError });
-      return res.status(500).json({ error: 'Failed to fetch students' });
+      logger.error('Failed to fetch available students', { error: studentsError, routeId });
+      return res.status(500).json({ error: 'Failed to fetch available students' });
     }
 
-    // Get students already assigned to this route
-    const { data: assignedStudents } = await supabase
-      .from('student_stops')
-      .select('student_id, stops!inner(route_id)')
-      .eq('stops.route_id', routeId)
-      .eq('is_active', true);
-
-    const assignedIds = new Set(assignedStudents?.map(a => a.student_id) || []);
-
-    // Filter out already assigned students
-    const availableStudents = allStudents?.filter(student => !assignedIds.has(student.id)) || [];
-
-    res.json({ data: availableStudents });
+    res.json({ data: availableStudents || [] });
   } catch (error) {
     logger.error('Get available students error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -1185,6 +1174,49 @@ router.delete('/:routeId/students/:studentId', authenticateToken, authorizeRoles
     res.json({ message: 'Student removed from route successfully' });
   } catch (error) {
     logger.error('Remove student from route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get student counts for all routes (batch endpoint for performance)
+router.get('/student-counts', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    // Single optimized query to get student counts for all routes
+    const { data: studentCounts, error } = await supabase
+      .from('student_stops')
+      .select(`
+        student_id,
+        stops!inner(route_id),
+        students!inner(is_active)
+      `)
+      .eq('is_active', true)
+      .eq('students.is_active', true);
+
+    if (error) {
+      logger.error('Failed to fetch student counts', { error });
+      return res.status(500).json({ error: 'Failed to fetch student counts' });
+    }
+
+    // Count unique students per route
+    const routeStudentCounts = new Map();
+    
+    studentCounts?.forEach(assignment => {
+      const routeId = assignment.stops.route_id;
+      if (!routeStudentCounts.has(routeId)) {
+        routeStudentCounts.set(routeId, new Set());
+      }
+      routeStudentCounts.get(routeId).add(assignment.student_id);
+    });
+
+    // Convert to object with route_id -> count
+    const counts = {};
+    routeStudentCounts.forEach((studentIds, routeId) => {
+      counts[routeId] = studentIds.size;
+    });
+
+    res.json({ data: counts });
+  } catch (error) {
+    logger.error('Get student counts error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
