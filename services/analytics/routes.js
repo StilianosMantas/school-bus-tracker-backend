@@ -43,6 +43,99 @@ const reportSchema = Joi.object({
   bus_id: Joi.string().uuid().optional()
 });
 
+// Overview endpoint for Reports page
+router.get('/overview', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    // Get total routes with student counts
+    const { data: routes, error: routesError } = await supabase
+      .from('routes')
+      .select(`
+        id,
+        name,
+        is_active
+      `)
+      .eq('is_active', true);
+
+    if (routesError) {
+      logger.error('Error fetching routes for overview:', routesError);
+      return res.status(500).json({ error: 'Failed to fetch routes data' });
+    }
+
+    // Get student counts per route (simplified for overview)
+    const { data: studentCounts, error: studentCountsError } = await supabase
+      .from('student_stops')
+      .select(`
+        student_id,
+        stops(route_id)
+      `)
+      .eq('is_active', true);
+
+    // Count students per route
+    const routeStudentCounts = {};
+    studentCounts?.forEach(assignment => {
+      const routeId = assignment.stops?.route_id;
+      if (routeId) {
+        if (!routeStudentCounts[routeId]) {
+          routeStudentCounts[routeId] = new Set();
+        }
+        routeStudentCounts[routeId].add(assignment.student_id);
+      }
+    });
+
+    // Transform routes data for frontend
+    const routesWithCounts = routes?.map(route => ({
+      id: route.id,
+      name: route.name,
+      total_trips: 0, // Placeholder for now
+      student_count: routeStudentCounts[route.id]?.size || 0
+    })) || [];
+
+    // Get total students
+    const { count: totalStudents } = await supabase
+      .from('students')
+      .select('*', { count: 'exact', head: true })
+      .eq('is_active', true);
+
+    // Get active buses count
+    const { count: activeBuses } = await supabase
+      .from('active_trips')
+      .select('*', { count: 'exact', head: true })
+      .gte('created_at', today.toISOString())
+      .is('ended_at', null);
+
+    // Get incidents count
+    const { count: incidentsCount } = await supabase
+      .from('incidents')
+      .select('*', { count: 'exact', head: true })
+      .gte('created_at', today.toISOString());
+
+    // Mock attendance data for now
+    const attendanceData = {
+      present: Math.floor((totalStudents || 0) * 0.85),
+      absent: Math.floor((totalStudents || 0) * 0.10),
+      no_show: Math.floor((totalStudents || 0) * 0.05)
+    };
+
+    res.json({
+      total_trips: 0, // Will be calculated from actual trips data
+      total_students: totalStudents || 0,
+      active_buses: activeBuses || 0,
+      incidents_count: incidentsCount || 0,
+      routes: routesWithCounts,
+      attendance: attendanceData,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('Error fetching overview data:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Dashboard overview
 router.get('/dashboard', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
   try {

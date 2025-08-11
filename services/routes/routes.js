@@ -1351,8 +1351,8 @@ router.get('/student-counts', authenticateToken, authorizeRoles(['admin', 'dispa
       .from('student_stops')
       .select(`
         student_id,
-        stops!inner(route_id),
-        students!inner(is_active)
+        stops(route_id),
+        students(is_active)
       `)
       .eq('is_active', true)
       .eq('students.is_active', true);
