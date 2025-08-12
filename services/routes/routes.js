@@ -1550,17 +1550,30 @@ router.delete('/:routeId/students/:studentId', authenticateToken, authorizeRoles
   try {
     const { routeId, studentId } = req.params;
 
-    // Remove from student_stops table
+    // First get all stop IDs for this route
+    const { data: routeStops, error: stopsError } = await supabase
+      .from('stops')
+      .select('id')
+      .eq('route_id', routeId);
+
+    if (stopsError) {
+      logger.error('Failed to fetch route stops for deletion', { error: stopsError, routeId });
+      return res.status(500).json({ error: 'Failed to fetch route stops' });
+    }
+
+    if (!routeStops || routeStops.length === 0) {
+      return res.status(404).json({ error: 'No stops found for this route' });
+    }
+
+    // Ensure routeStops is an array before mapping
+    const stopIds = Array.isArray(routeStops) ? routeStops.map(stop => stop.id) : [];
+
+    // Remove student from all stops in this route
     const { error } = await supabase
       .from('student_stops')
       .delete()
       .eq('student_id', studentId)
-      .in('stop_id', 
-        supabase
-          .from('stops')
-          .select('id')
-          .eq('route_id', routeId)
-      );
+      .in('stop_id', stopIds);
 
     if (error) {
       logger.error('Failed to remove student from route', { error, routeId, studentId });
@@ -1572,6 +1585,44 @@ router.delete('/:routeId/students/:studentId', authenticateToken, authorizeRoles
     res.json({ message: 'Student removed from route successfully' });
   } catch (error) {
     logger.error('Remove student from route error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove student from specific stop (Admin only)
+router.delete('/:routeId/stops/:stopId/students/:studentId', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { routeId, stopId, studentId } = req.params;
+
+    // Verify that the stop belongs to the route
+    const { data: stop, error: stopError } = await supabase
+      .from('stops')
+      .select('id')
+      .eq('id', stopId)
+      .eq('route_id', routeId)
+      .single();
+
+    if (stopError || !stop) {
+      return res.status(404).json({ error: 'Stop not found in this route' });
+    }
+
+    // Remove student from this specific stop
+    const { error } = await supabase
+      .from('student_stops')
+      .delete()
+      .eq('student_id', studentId)
+      .eq('stop_id', stopId);
+
+    if (error) {
+      logger.error('Failed to remove student from stop', { error, routeId, stopId, studentId });
+      return res.status(500).json({ error: 'Failed to remove student from stop' });
+    }
+
+    logger.info('Student removed from stop', { routeId, stopId, studentId, userId: req.user.id });
+
+    res.json({ message: 'Student removed from stop successfully' });
+  } catch (error) {
+    logger.error('Remove student from stop error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

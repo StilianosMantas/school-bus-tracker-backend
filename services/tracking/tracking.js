@@ -262,14 +262,41 @@ router.get('/predefined-locations', authenticateToken, async (req, res) => {
       query = query.eq('category', category);
     }
 
-    const { data, error } = await query;
+    const { data: locations, error } = await query;
 
     if (error) {
       logger.error('Failed to fetch predefined locations', { error });
       return res.status(500).json({ error: 'Failed to fetch predefined locations' });
     }
 
-    res.json({ data });
+    // Get settings to match category display names
+    const { data: settings } = await supabase
+      .from('settings')
+      .select('key, value')
+      .like('key', 'location_category_%');
+
+    // Create category display name mapping from settings
+    const categoryMap = {};
+    settings?.forEach(setting => {
+      if (setting.key.startsWith('location_category_')) {
+        const category = setting.key.replace('location_category_', '');
+        try {
+          const value = JSON.parse(setting.value);
+          categoryMap[category] = value.display_name;
+        } catch (e) {
+          // If parsing fails, use the value as is
+          categoryMap[category] = setting.value;
+        }
+      }
+    });
+
+    // Enhance locations with display names from settings
+    const enhancedLocations = locations?.map(location => ({
+      ...location,
+      category_display_name: categoryMap[location.category] || location.category
+    }));
+
+    res.json({ data: enhancedLocations });
   } catch (error) {
     logger.error('Get predefined locations error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
