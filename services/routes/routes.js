@@ -1026,6 +1026,23 @@ router.put('/:routeId/stops/:stopId', authenticateToken, authorizeRoles(['admin'
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
+    // Check if stop_order already exists (excluding current stop)
+    if (updates.stop_order !== undefined) {
+      const { data: existingStop } = await supabase
+        .from('stops')
+        .select('id')
+        .eq('route_id', routeId)
+        .eq('stop_order', updates.stop_order)
+        .neq('id', stopId)
+        .single();
+
+      if (existingStop) {
+        return res.status(400).json({ 
+          error: 'Stop order already exists. Please reorder stops first.' 
+        });
+      }
+    }
+
     const { data, error } = await supabase
       .from('stops')
       .update(updates)
@@ -1185,8 +1202,7 @@ router.get('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'di
       `)
       .eq('stops.route_id', routeId)
       .eq('is_active', true)
-      .eq('students.is_active', true)
-      .order('students.name');
+      .eq('students.is_active', true);
 
     if (studentStopsError) {
       logger.error('Failed to fetch route students', { error: studentStopsError, routeId });
@@ -1221,7 +1237,8 @@ router.get('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'di
       });
     });
 
-    const students = Array.from(studentsMap.values());
+    const students = Array.from(studentsMap.values())
+      .sort((a, b) => a.name.localeCompare(b.name)); // Sort by name after processing
 
     res.json({ data: students });
   } catch (error) {
@@ -1235,8 +1252,38 @@ router.get('/:routeId/available-students', authenticateToken, authorizeRoles(['a
   try {
     const { routeId } = req.params;
 
-    // Optimized query: Use NOT EXISTS for better performance than separate queries + filtering
-    const { data: availableStudents, error: studentsError } = await supabase
+    // First, get all stops for this route
+    const { data: routeStops, error: stopsError } = await supabase
+      .from('stops')
+      .select('id')
+      .eq('route_id', routeId);
+
+    if (stopsError) {
+      logger.error('Failed to fetch route stops', { error: stopsError, routeId });
+      return res.status(500).json({ error: 'Failed to fetch route stops' });
+    }
+
+    const stopIds = routeStops ? routeStops.map(stop => stop.id) : [];
+
+    // Get students already assigned to this route
+    let assignedStudentIds = [];
+    if (stopIds.length > 0) {
+      const { data: assignedStudents, error: assignedError } = await supabase
+        .from('student_stops')
+        .select('student_id')
+        .in('stop_id', stopIds)
+        .eq('is_active', true);
+
+      if (assignedError) {
+        logger.error('Failed to fetch assigned students', { error: assignedError, routeId });
+        return res.status(500).json({ error: 'Failed to fetch assigned students' });
+      }
+
+      assignedStudentIds = assignedStudents ? assignedStudents.map(s => s.student_id) : [];
+    }
+
+    // Get all active students
+    const { data: allStudents, error: studentsError } = await supabase
       .from('students')
       .select(`
         id, 
@@ -1247,26 +1294,19 @@ router.get('/:routeId/available-students', authenticateToken, authorizeRoles(['a
         profiles!parent_id(id, full_name, phone)
       `)
       .eq('is_active', true)
-      .not('id', 'in', 
-        supabase
-          .from('student_stops')
-          .select('student_id')
-          .eq('is_active', true)
-          .in('stop_id',
-            supabase
-              .from('stops')
-              .select('id')
-              .eq('route_id', routeId)
-          )
-      )
       .order('name');
 
     if (studentsError) {
-      logger.error('Failed to fetch available students', { error: studentsError, routeId });
-      return res.status(500).json({ error: 'Failed to fetch available students' });
+      logger.error('Failed to fetch students', { error: studentsError, routeId });
+      return res.status(500).json({ error: 'Failed to fetch students' });
     }
 
-    res.json({ data: availableStudents || [] });
+    // Filter out already assigned students
+    const availableStudents = allStudents ? 
+      allStudents.filter(student => !assignedStudentIds.includes(student.id)) : 
+      [];
+
+    res.json({ data: availableStudents });
   } catch (error) {
     logger.error('Get available students error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
