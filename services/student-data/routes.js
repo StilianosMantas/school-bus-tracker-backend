@@ -9,6 +9,7 @@ const xlsx = require('xlsx');
 const fs = require('fs').promises;
 const path = require('path');
 const Joi = require('joi');
+const geocodingService = require('../geocoding/geocoding-service');
 
 const logger = createServiceLogger('student-data-service');
 
@@ -32,7 +33,6 @@ const upload = multer({
 const studentSchema = Joi.object({
   name: Joi.string().min(2).max(100).required(),
   grade: Joi.string().max(20).required(),
-  address: Joi.string().max(200).required(),
   medical_info: Joi.string().max(500).allow('', null),
   emergency_contact: Joi.string().max(100).allow('', null),
   emergency_phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).allow('', null),
@@ -130,11 +130,13 @@ router.get('/export', authenticateToken, authorizeRoles(['admin']), async (req, 
     }
 
     // Format data for CSV export
-    const csvData = students.map(student => ({
-      'Όνομα': student.name,
-      'Τάξη': student.grade,
-      'Διεύθυνση': student.address,
-      'Ιατρικές Πληροφορίες': student.medical_info || '',
+    const csvData = students.map(student => {
+      const primaryAddress = student.addresses?.find(addr => addr.address_type === 'primary');
+      return {
+        'Όνομα': student.name,
+        'Τάξη': student.grade,
+        'Διεύθυνση': primaryAddress?.full_address || '',
+        'Ιατρικές Πληροφορίες': student.medical_info || '',
       'Δευτερεύουσα Επαφή': student.emergency_contact || '',
       'Τηλέφωνο Δευτερεύουσας Επαφής': student.emergency_phone || '',
       'Email Γονέα': student.parent?.email || '',
@@ -143,7 +145,8 @@ router.get('/export', authenticateToken, authorizeRoles(['admin']), async (req, 
       'Στάση': student.stop?.name || '',
       'Διαδρομή': student.stop?.route?.name || '',
       'Ενεργός': student.is_active ? 'Ναι' : 'Όχι'
-    }));
+      };
+    });
 
     // Convert to CSV
     if (csvData.length === 0) {
@@ -329,7 +332,7 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['name', 'grade', 'address', 'medical_info', 'emergency_contact', 'emergency_phone', 'external_student_id', 'stop_id', 'is_active'];
+    const allowedFields = ['name', 'grade', 'medical_info', 'emergency_contact', 'emergency_phone', 'external_student_id', 'stop_id', 'is_active'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
@@ -380,11 +383,11 @@ router.get('/route/:routeId', authenticateToken, authorizeRoles(['admin', 'dispa
         id,
         name,
         grade,
-        address,
         medical_info,
         emergency_contact,
         emergency_phone,
         is_active,
+        addresses:student_addresses(*),
         parent:profiles!parent_id(id, full_name, phone),
         stop:stops!stop_id(id, name, route_id)
       `)
@@ -440,7 +443,7 @@ router.get('/route/:routeId', authenticateToken, authorizeRoles(['admin', 'dispa
       name: student.name,
       full_name: student.name, // For compatibility
       grade: student.grade,
-      address: student.address,
+      address: student.addresses?.find(addr => addr.address_type === 'primary')?.full_address || '',
       medical_info: student.medical_info,
       emergency_contact: student.emergency_contact,
       emergency_phone: student.emergency_phone,
@@ -508,7 +511,7 @@ router.get('/route/:routeId/stop/:stopId', authenticateToken, authorizeRoles(['d
       parent_phone: student.parent?.phone,
       parent_name: student.parent?.full_name,
       parent_email: student.parent?.email,
-      home_address: student.address
+      home_address: student.addresses?.find(addr => addr.address_type === 'primary')?.full_address || ''
     }));
 
     logger.info('Students fetched for route/stop', { 
@@ -1455,12 +1458,42 @@ router.post('/:studentId/addresses', authenticateToken, authorizeRoles(['admin']
         .eq('address_type', 'primary');
     }
 
+    // Try to geocode the address (commented out for now - activate after testing)
+    let coordinates = null;
+    // if (value.full_address) {
+    //   try {
+    //     coordinates = await geocodingService.geocodeAddress(value.full_address, 'GR');
+    //     if (coordinates) {
+    //       logger.info('Address geocoded successfully', { 
+    //         address: value.full_address, 
+    //         latitude: coordinates.latitude, 
+    //         longitude: coordinates.longitude,
+    //         cached: coordinates.cached 
+    //       });
+    //     }
+    //   } catch (geocodingError) {
+    //     logger.warn('Failed to geocode address during creation', { 
+    //       error: geocodingError.message, 
+    //       address: value.full_address 
+    //     });
+    //   }
+    // }
+
+    const addressData = {
+      ...value,
+      student_id: studentId
+    };
+
+    // Add coordinates if geocoding was successful
+    if (coordinates) {
+      addressData.latitude = coordinates.latitude;
+      addressData.longitude = coordinates.longitude;
+      addressData.postal_code = coordinates.postal_code || value.postal_code;
+    }
+
     const { data, error } = await supabase
       .from('student_addresses')
-      .insert({
-        ...value,
-        student_id: studentId
-      })
+      .insert(addressData)
       .select()
       .single();
 
@@ -1502,9 +1535,41 @@ router.put('/:studentId/addresses/:addressId', authenticateToken, authorizeRoles
         .neq('id', addressId);
     }
 
+    // Try to geocode the address if full_address was updated (commented out for now)
+    let coordinates = null;
+    // if (value.full_address) {
+    //   try {
+    //     coordinates = await geocodingService.geocodeAddress(value.full_address, 'GR');
+    //     if (coordinates) {
+    //       logger.info('Address geocoded successfully during update', { 
+    //         address: value.full_address, 
+    //         latitude: coordinates.latitude, 
+    //         longitude: coordinates.longitude,
+    //         cached: coordinates.cached,
+    //         addressId 
+    //       });
+    //     }
+    //   } catch (geocodingError) {
+    //     logger.warn('Failed to geocode address during update', { 
+    //       error: geocodingError.message, 
+    //       address: value.full_address,
+    //       addressId 
+    //     });
+    //   }
+    // }
+
+    const updateData = { ...value };
+
+    // Add coordinates if geocoding was successful
+    if (coordinates) {
+      updateData.latitude = coordinates.latitude;
+      updateData.longitude = coordinates.longitude;
+      updateData.postal_code = coordinates.postal_code || value.postal_code;
+    }
+
     const { data, error } = await supabase
       .from('student_addresses')
-      .update(value)
+      .update(updateData)
       .eq('id', addressId)
       .eq('student_id', studentId)
       .select()

@@ -32,6 +32,7 @@ app.use('/api/notifications', require('../services/notifications/routes'));
 app.use('/api/analytics', require('../services/analytics/routes'));
 app.use('/api/students', require('../services/student-data/routes'));
 app.use('/api/student-data', require('../services/student-data/routes'));
+app.use('/api/geocoding', require('../services/geocoding/routes'));
 
 // Health check
 app.get('/health', (req, res) => {

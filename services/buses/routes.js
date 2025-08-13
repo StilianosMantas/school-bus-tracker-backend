@@ -11,7 +11,12 @@ const logger = createServiceLogger('buses-service');
 const busSchema = Joi.object({
   bus_number: Joi.string().min(1).max(20).required(),
   capacity: Joi.number().integer().min(10).max(100).required(),
-  status: Joi.string().valid('active', 'maintenance', 'retired').default('active')
+  status: Joi.string().valid('active', 'maintenance', 'retired').default('active'),
+  plate_number: Joi.string().max(20).allow(null, ''),
+  engine_type: Joi.string().valid('petrol', 'diesel', 'gas', 'hybrid', 'electric').default('petrol'),
+  width: Joi.number().positive().allow(null),
+  length: Joi.number().positive().allow(null),
+  consumption_per_100km: Joi.number().positive().allow(null)
 });
 
 // Health check
@@ -123,7 +128,7 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['bus_number', 'capacity', 'status'];
+    const allowedFields = ['bus_number', 'capacity', 'status', 'plate_number', 'engine_type', 'width', 'length', 'consumption_per_100km'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];

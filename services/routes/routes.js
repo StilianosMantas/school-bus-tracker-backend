@@ -1194,8 +1194,8 @@ router.get('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'di
           id, 
           name, 
           grade, 
-          address, 
           is_active,
+          addresses:student_addresses(*),
           profiles!parent_id(id, full_name)
         ),
         stops!inner(id, name, route_id)
@@ -1221,7 +1221,7 @@ router.get('/:routeId/students', authenticateToken, authorizeRoles(['admin', 'di
           id: student.id,
           name: student.name,
           grade: student.grade,
-          address: student.address,
+          address: student.addresses?.find(addr => addr.address_type === 'primary')?.full_address || '',
           is_active: student.is_active,
           parent: student.profiles,
           assignments: []
