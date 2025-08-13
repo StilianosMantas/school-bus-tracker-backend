@@ -746,11 +746,34 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
 
         // Create primary address for the student
         if (address && address.trim()) {
+          // Parse address to extract street name and number for required fields
+          const addressParts = address.trim().match(/^(.+?)\s+(\d+[^\d]*?)(?:,|$)/);
+          let streetName = address.trim();
+          let streetNumber = '1'; // Default number if can't parse
+          
+          if (addressParts) {
+            streetName = addressParts[1].trim();
+            streetNumber = addressParts[2].trim();
+          } else {
+            // If can't parse, use the full address as street name and default number
+            const parts = address.trim().split(/\s+/);
+            if (parts.length > 1) {
+              // Check if last part looks like a number
+              const lastPart = parts[parts.length - 1];
+              if (/^\d+[^\d]*$/.test(lastPart)) {
+                streetNumber = lastPart;
+                streetName = parts.slice(0, -1).join(' ');
+              }
+            }
+          }
+          
           const { error: addressError } = await supabase
             .from('student_addresses')
             .insert({
               student_id: createdStudent.id,
               address_type: 'primary',
+              street_name: streetName,
+              street_number: streetNumber,
               full_address: address.trim(),
               city: 'Αθήνα',
               is_active: true,
