@@ -630,6 +630,9 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
           grade: studentData.grade || studentData.Grade || studentData['Τάξη'],
           address: studentData.address || studentData.Address || studentData['Διεύθυνση'],
           medical_info: studentData.medical_info || studentData['Medical Info'] || studentData['Ιατρικές Πληροφορίες'] || '',
+          external_student_id: studentData.external_student_id || studentData['External Student ID'] || studentData['Κωδικός Μαθητή'] || '',
+          emergency_contact: studentData.emergency_contact || studentData['Emergency Contact'] || studentData['Δευτερεύουσα Επαφή'] || '',
+          emergency_phone: studentData.emergency_phone || studentData['Emergency Phone'] || studentData['Τηλέφωνο Έκτακτης Ανάγκης'] || '',
           parent_email: studentData.parent_email || studentData['Parent Email'] || studentData['Email Γονέα'],
           parent_name: studentData.parent_name || studentData['Parent Name'] || studentData['Όνομα Γονέα'],
           parent_phone: studentData.parent_phone || studentData['Parent Phone'] || studentData['Τηλέφωνο Γονέα']
@@ -722,12 +725,14 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
         }
 
         // Create student
-        const { error: studentError } = await supabase
+        const { data: createdStudent, error: studentError } = await supabase
           .from('students')
           .insert({
             ...studentInfo,
             parent_id: parent.id
-          });
+          })
+          .select()
+          .single();
 
         if (studentError) {
           results.failed++;
@@ -737,6 +742,30 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
             data: studentData
           });
           continue;
+        }
+
+        // Create primary address for the student
+        if (studentInfo.address) {
+          const { error: addressError } = await supabase
+            .from('student_addresses')
+            .insert({
+              student_id: createdStudent.id,
+              address_type: 'primary',
+              full_address: studentInfo.address,
+              city: 'Αθήνα',
+              is_active: true,
+              is_pickup_address: true,
+              is_dropoff_address: true,
+              priority_order: 0
+            });
+
+          if (addressError) {
+            logger.warn('Failed to create primary address for student during import', { 
+              error: addressError, 
+              studentId: createdStudent.id 
+            });
+            // Don't fail the import if address creation fails, just log it
+          }
         }
 
         results.successful++;
@@ -922,22 +951,28 @@ router.post('/attendance/batch', authenticateToken, authorizeRoles(['driver']), 
 router.get('/template/download', authenticateToken, authorizeRoles(['admin']), (req, res) => {
   const template = [
     {
-      'Όνομα': 'Μαρία Παπαδοπούλου',
-      'Τάξη': 'Δ΄ Δημοτικού',
-      'Διεύθυνση': 'Πατησίων 45, Αθήνα',
-      'Ιατρικές Πληροφορίες': 'Αλλεργία στα φιστίκια',
-      'Email Γονέα': 'parent1@example.com',
-      'Όνομα Γονέα': 'Γιώργος Παπαδόπουλος',
-      'Τηλέφωνο Γονέα': '+306912345678'
+      'name': 'Μαρία Παπαδοπούλου',
+      'grade': '4',
+      'parent_email': 'parent1@example.com',
+      'parent_name': 'Γιώργος Παπαδόπουλος',
+      'parent_phone': '+306912345678',
+      'address': 'Πατησίων 45, Εξάρχεια, 10681 Αθήνα',
+      'external_student_id': '10001',
+      'medical_info': 'Αλλεργία στα φιστίκια',
+      'emergency_contact': 'Γιαγιά Ελένη',
+      'emergency_phone': '6923456001'
     },
     {
-      'Όνομα': 'Νίκος Γεωργίου',
-      'Τάξη': 'Ε΄ Δημοτικού',
-      'Διεύθυνση': 'Σταδίου 10, Αθήνα',
-      'Ιατρικές Πληροφορίες': '',
-      'Email Γονέα': 'parent2@example.com',
-      'Όνομα Γονέα': 'Ελένη Γεωργίου',
-      'Τηλέφωνο Γονέα': '6923456789'
+      'name': 'Νίκος Γεωργίου',
+      'grade': '5',
+      'parent_email': 'parent2@example.com',
+      'parent_name': 'Ελένη Γεωργίου',
+      'parent_phone': '6923456789',
+      'address': 'Σταδίου 10, Κέντρο, 10564 Αθήνα',
+      'external_student_id': '10002',
+      'medical_info': '',
+      'emergency_contact': 'Παππούς Νίκος',
+      'emergency_phone': '6923456002'
     }
   ];
 
