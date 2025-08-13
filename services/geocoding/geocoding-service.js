@@ -1,9 +1,10 @@
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-const logger = require('../../utils/logger');
+const { createServiceLogger } = require('../../shared/logger');
 
 // Initialize Supabase client
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const logger = createServiceLogger('geocoding-service');
 
 class GeocodingService {
   constructor() {

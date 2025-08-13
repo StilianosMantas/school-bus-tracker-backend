@@ -1,8 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const geocodingService = require('./geocoding-service');
-const { authenticateToken, authorizeRoles } = require('../../middleware/auth');
-const logger = require('../../utils/logger');
+const { authenticateToken, authorizeRoles } = require('../auth/middleware');
+const { createServiceLogger } = require('../../shared/logger');
+
+const logger = createServiceLogger('geocoding-routes');
 
 // Test geocoding endpoint (Admin only)
 router.post('/test', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
