@@ -650,8 +650,8 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
           continue;
         }
 
-        // Process parent
-        const { parent_email, parent_name, parent_phone, ...studentInfo } = value;
+        // Process parent and address
+        const { parent_email, parent_name, parent_phone, address, ...studentInfo } = value;
 
         // Check if parent exists
         let { data: parent } = await supabase
@@ -745,13 +745,13 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
         }
 
         // Create primary address for the student
-        if (studentInfo.address) {
+        if (address && address.trim()) {
           const { error: addressError } = await supabase
             .from('student_addresses')
             .insert({
               student_id: createdStudent.id,
               address_type: 'primary',
-              full_address: studentInfo.address,
+              full_address: address.trim(),
               city: 'Αθήνα',
               is_active: true,
               is_pickup_address: true,
@@ -762,9 +762,15 @@ router.post('/import', authenticateToken, authorizeRoles(['admin']), upload.sing
           if (addressError) {
             logger.warn('Failed to create primary address for student during import', { 
               error: addressError, 
-              studentId: createdStudent.id 
+              studentId: createdStudent.id,
+              address: address.trim()
             });
             // Don't fail the import if address creation fails, just log it
+          } else {
+            logger.info('Primary address created for student during import', {
+              studentId: createdStudent.id,
+              address: address.trim()
+            });
           }
         }
 
