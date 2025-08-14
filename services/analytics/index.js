@@ -19,7 +19,15 @@ const logger = winston.createLogger({
 });
 
 // Middleware
-app.use(cors());
+ 
+
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production' 
+    ? ['https://your-driver-app.vercel.app', 'https://your-admin-app.vercel.app', 'https://admin-bhca.onrender.com']
+    : ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003','https://admin-bhca.onrender.com'],
+  credentials: true
+}));
+
 app.use(express.json());
 
 // Health check
