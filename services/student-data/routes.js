@@ -1484,8 +1484,20 @@ router.post('/:studentId/addresses', authenticateToken, authorizeRoles(['admin']
       student_id: studentId
     };
 
-    // Add coordinates if geocoding was successful
-    if (coordinates) {
+    // Check if coordinates were passed from frontend (e.g., from test button)
+    if (req.body._geocoded_coordinates) {
+      const coords = req.body._geocoded_coordinates;
+      addressData.latitude = coords.latitude;
+      addressData.longitude = coords.longitude;
+      addressData.postal_code = coords.postal_code || value.postal_code;
+      
+      logger.info('Using coordinates passed from frontend for new address', { 
+        studentId, 
+        coordinates: { lat: coords.latitude, lon: coords.longitude },
+        cached: coords.cached 
+      });
+    } else if (coordinates) {
+      // Add coordinates if geocoding was successful (when automatic geocoding is enabled)
       addressData.latitude = coordinates.latitude;
       addressData.longitude = coordinates.longitude;
       addressData.postal_code = coordinates.postal_code || value.postal_code;
@@ -1560,8 +1572,20 @@ router.put('/:studentId/addresses/:addressId', authenticateToken, authorizeRoles
 
     const updateData = { ...value };
 
-    // Add coordinates if geocoding was successful
-    if (coordinates) {
+    // Check if coordinates were passed from frontend (e.g., from test button)
+    if (req.body._geocoded_coordinates) {
+      const coords = req.body._geocoded_coordinates;
+      updateData.latitude = coords.latitude;
+      updateData.longitude = coords.longitude;
+      updateData.postal_code = coords.postal_code || value.postal_code;
+      
+      logger.info('Using coordinates passed from frontend', { 
+        addressId, 
+        coordinates: { lat: coords.latitude, lon: coords.longitude },
+        cached: coords.cached 
+      });
+    } else if (coordinates) {
+      // Add coordinates if geocoding was successful (when automatic geocoding is enabled)
       updateData.latitude = coordinates.latitude;
       updateData.longitude = coordinates.longitude;
       updateData.postal_code = coordinates.postal_code || value.postal_code;
