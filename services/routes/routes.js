@@ -1289,11 +1289,13 @@ router.get('/:routeId/available-students', authenticateToken, authorizeRoles(['a
         id, 
         name, 
         grade, 
-        address, 
         is_active,
+        student_addresses!inner(full_address),
         profiles!parent_id(id, full_name, phone)
       `)
       .eq('is_active', true)
+      .eq('student_addresses.is_active', true)
+      .eq('student_addresses.address_type', 'primary')
       .order('name');
 
     if (studentsError) {
