@@ -15,7 +15,7 @@ const PORT = process.env.PORT || process.env.GATEWAY_PORT || 3000;
 app.use(helmet());
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
-    ? ['https://your-driver-app.vercel.app', 'https://your-admin-app.vercel.app']
+    ? ['https://your-driver-app.vercel.app', 'https://your-admin-app.vercel.app', 'https://admin-bhca.onrender.com']
     : ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003'],
   credentials: true
 }));
