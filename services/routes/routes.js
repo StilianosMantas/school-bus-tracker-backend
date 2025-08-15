@@ -5,6 +5,9 @@ const { createServiceLogger } = require('../../shared/logger');
 const { authenticateToken, authorizeRoles } = require('../auth/middleware');
 const Joi = require('joi');
 
+// Route planning endpoints
+const planningRoutes = require('./planningRoutes');
+
 const logger = createServiceLogger('routes-service');
 
 // Validation schemas
@@ -54,6 +57,9 @@ router.get('/health', (req, res) => {
     message: 'Routes service is running' 
   });
 });
+
+// Mount route planning endpoints
+router.use('/planning', planningRoutes);
 
 // Debug endpoint for driver schedules
 router.get('/driver/debug', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
