@@ -13,6 +13,15 @@ const geocodingService = require('../geocoding/geocoding-service');
 
 const logger = createServiceLogger('student-data-service');
 
+// Days of week mapping
+const DAYS_OF_WEEK = [
+  { value: 1, label: 'Δευτέρα', short: 'Δευ' },
+  { value: 2, label: 'Τρίτη', short: 'Τρι' },
+  { value: 3, label: 'Τετάρτη', short: 'Τετ' },
+  { value: 4, label: 'Πέμπτη', short: 'Πεμ' },
+  { value: 5, label: 'Παρασκευή', short: 'Παρ' }
+];
+
 // Configure multer for file uploads
 const upload = multer({
   dest: 'uploads/',
@@ -168,6 +177,120 @@ router.get('/export', authenticateToken, authorizeRoles(['admin']), async (req, 
     res.send('\uFEFF' + csvContent); // Add BOM for proper UTF-8 encoding in Excel
   } catch (error) {
     logger.error('Export students error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== TIME SLOTS MANAGEMENT ENDPOINTS ====================
+
+// Time slot validation schema
+const timeSlotSchema = Joi.object({
+  slot_name: Joi.string().min(2).max(100).required(),
+  time_value: Joi.string().pattern(/^([01]\d|2[0-3]):([0-5]\d)$/).required(),
+  slot_type: Joi.string().valid('pickup', 'dropoff').required(),
+  is_active: Joi.boolean().default(true),
+  display_order: Joi.number().integer().min(0).default(0)
+});
+
+// Get all time slots (Admin only)
+router.get('/time-slots', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('school_time_slots')
+      .select('*')
+      .order('slot_type', { ascending: true })
+      .order('display_order', { ascending: true });
+
+    if (error) {
+      logger.error('Failed to fetch time slots', { error });
+      return res.status(500).json({ error: 'Failed to fetch time slots' });
+    }
+
+    res.json({ data: data || [] });
+  } catch (error) {
+    logger.error('Get time slots error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create new time slot (Admin only)
+router.post('/time-slots', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { error: validationError, value } = timeSlotSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    const { data, error } = await supabase
+      .from('school_time_slots')
+      .insert(value)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to create time slot', { error });
+      return res.status(500).json({ error: 'Failed to create time slot' });
+    }
+
+    logger.info('Time slot created', { timeSlotId: data.id, userId: req.user.id });
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Create time slot error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update time slot (Admin only)
+router.put('/time-slots/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error: validationError, value } = timeSlotSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    const { data, error } = await supabase
+      .from('school_time_slots')
+      .update(value)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Time slot not found' });
+      }
+      logger.error('Failed to update time slot', { error });
+      return res.status(500).json({ error: 'Failed to update time slot' });
+    }
+
+    logger.info('Time slot updated', { timeSlotId: id, userId: req.user.id });
+    res.json({ data });
+  } catch (error) {
+    logger.error('Update time slot error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete time slot (Admin only)
+router.delete('/time-slots/:id', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from('school_time_slots')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      logger.error('Failed to delete time slot', { error });
+      return res.status(500).json({ error: 'Failed to delete time slot' });
+    }
+
+    logger.info('Time slot deleted', { timeSlotId: id, userId: req.user.id });
+    res.json({ message: 'Time slot deleted successfully' });
+  } catch (error) {
+    logger.error('Delete time slot error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1706,6 +1829,740 @@ router.put('/:studentId/addresses/reorder', authenticateToken, authorizeRoles(['
   } catch (error) {
     logger.error('Reorder student addresses error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== STUDENT SCHEDULING ENDPOINTS ====================
+
+// Student schedule validation schema
+const scheduleSchema = Joi.object({
+  day_of_week: Joi.number().integer().min(0).max(6).required(),
+  pickup_address_id: Joi.string().uuid().allow(null).optional(),
+  pickup_time_slot_id: Joi.string().uuid().allow(null).optional(),
+  dropoff_address_id: Joi.string().uuid().allow(null).optional(),
+  dropoff_time_slot_id: Joi.string().uuid().allow(null).optional(),
+  is_active: Joi.boolean().default(true),
+  notes: Joi.string().max(500).allow('', null).optional()
+});
+
+// Get student weekly schedule
+router.get('/:studentId/schedule', authenticateToken, authorizeRoles(['admin', 'parent']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    
+    // For parent role, verify they own this student
+    if (req.user.role === 'parent') {
+      const { data: student } = await supabase
+        .from('students')
+        .select('parent_id')
+        .eq('id', studentId)
+        .single();
+        
+      if (!student || student.parent_id !== req.user.id) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('student_weekly_schedules')
+      .select(`
+        *,
+        pickup_address:student_addresses!pickup_address_id(*),
+        pickup_time_slot:school_time_slots!pickup_time_slot_id(*),
+        dropoff_address:student_addresses!dropoff_address_id(*),
+        dropoff_time_slot:school_time_slots!dropoff_time_slot_id(*)
+      `)
+      .eq('student_id', studentId)
+      .order('day_of_week');
+
+    if (error) {
+      logger.error('Failed to fetch student schedule', { error });
+      return res.status(500).json({ error: 'Failed to fetch schedule' });
+    }
+
+    res.json({ data: data || [] });
+  } catch (error) {
+    logger.error('Get student schedule error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update student daily schedule (Admin only)
+router.put('/:studentId/schedule/:dayOfWeek', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId, dayOfWeek } = req.params;
+    const dayNumber = parseInt(dayOfWeek);
+    
+    if (isNaN(dayNumber) || dayNumber < 0 || dayNumber > 6) {
+      return res.status(400).json({ error: 'Invalid day of week (0-6)' });
+    }
+
+    const { error: validationError, value } = scheduleSchema.validate({
+      ...req.body,
+      day_of_week: dayNumber
+    });
+    
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    // Verify student exists
+    const { data: student } = await supabase
+      .from('students')
+      .select('id')
+      .eq('id', studentId)
+      .single();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Upsert the schedule (insert or update)
+    const { data, error } = await supabase
+      .from('student_weekly_schedules')
+      .upsert({
+        student_id: studentId,
+        ...value
+      })
+      .select(`
+        *,
+        pickup_address:student_addresses!pickup_address_id(*),
+        pickup_time_slot:school_time_slots!pickup_time_slot_id(*),
+        dropoff_address:student_addresses!dropoff_address_id(*),
+        dropoff_time_slot:school_time_slots!dropoff_time_slot_id(*)
+      `)
+      .single();
+
+    if (error) {
+      logger.error('Failed to update student schedule', { error });
+      return res.status(500).json({ error: 'Failed to update schedule' });
+    }
+
+    logger.info('Student schedule updated', { 
+      studentId, 
+      dayOfWeek: dayNumber, 
+      userId: req.user.id 
+    });
+    
+    res.json({ data });
+  } catch (error) {
+    logger.error('Update student schedule error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Bulk update student weekly schedule (Admin only)
+router.put('/:studentId/schedule', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const { schedules } = req.body;
+
+    if (!Array.isArray(schedules)) {
+      return res.status(400).json({ error: 'Schedules must be an array' });
+    }
+
+    // Verify student exists
+    const { data: student, error: studentError } = await supabase
+      .from('students')
+      .select('id')
+      .eq('id', studentId)
+      .single();
+
+    if (studentError || !student) {
+      logger.error('Student not found', { studentId, error: studentError });
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Validate all schedules
+    const validatedSchedules = [];
+    for (const schedule of schedules) {
+      const { error: validationError, value } = scheduleSchema.validate(schedule);
+      if (validationError) {
+        return res.status(400).json({ 
+          error: `Day ${schedule.day_of_week}: ${validationError.details[0].message}` 
+        });
+      }
+      validatedSchedules.push({
+        student_id: studentId,
+        ...value
+      });
+    }
+
+    // Upsert all schedules with proper conflict resolution
+    const { data, error } = await supabase
+      .from('student_weekly_schedules')
+      .upsert(validatedSchedules, { 
+        onConflict: 'student_id,day_of_week',
+        ignoreDuplicates: false 
+      })
+      .select(`
+        *,
+        pickup_address:student_addresses!pickup_address_id(*),
+        pickup_time_slot:school_time_slots!pickup_time_slot_id(*),
+        dropoff_address:student_addresses!dropoff_address_id(*),
+        dropoff_time_slot:school_time_slots!dropoff_time_slot_id(*)
+      `);
+
+    if (error) {
+      logger.error('Failed to bulk update student schedule', { error });
+      return res.status(500).json({ error: 'Failed to update schedule' });
+    }
+
+    logger.info('Student weekly schedule updated', { 
+      studentId, 
+      daysUpdated: validatedSchedules.length,
+      userId: req.user.id 
+    });
+    
+    res.json({ data });
+  } catch (error) {
+    logger.error('Bulk update student schedule error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== SCHEDULE EXCEPTIONS ENDPOINTS ====================
+
+// Schedule exception validation schema
+const exceptionSchema = Joi.object({
+  exception_date: Joi.date().iso().required(),
+  pickup_address_id: Joi.string().uuid().allow(null).optional(),
+  pickup_time_slot_id: Joi.string().uuid().allow(null).optional(),
+  dropoff_address_id: Joi.string().uuid().allow(null).optional(),
+  dropoff_time_slot_id: Joi.string().uuid().allow(null).optional(),
+  reason: Joi.string().max(100).allow('', null).optional(),
+  notes: Joi.string().max(500).allow('', null).optional()
+});
+
+// Get student schedule exceptions
+router.get('/:studentId/schedule/exceptions', authenticateToken, authorizeRoles(['admin', 'parent']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const { from_date, to_date } = req.query;
+    
+    // For parent role, verify they own this student
+    if (req.user.role === 'parent') {
+      const { data: student } = await supabase
+        .from('students')
+        .select('parent_id')
+        .eq('id', studentId)
+        .single();
+        
+      if (!student || student.parent_id !== req.user.id) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    let query = supabase
+      .from('student_schedule_exceptions')
+      .select(`
+        *,
+        pickup_address:student_addresses!pickup_address_id(*),
+        pickup_time_slot:school_time_slots!pickup_time_slot_id(*),
+        dropoff_address:student_addresses!dropoff_address_id(*),
+        dropoff_time_slot:school_time_slots!dropoff_time_slot_id(*)
+      `)
+      .eq('student_id', studentId)
+      .order('exception_date');
+
+    if (from_date) {
+      query = query.gte('exception_date', from_date);
+    }
+    if (to_date) {
+      query = query.lte('exception_date', to_date);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to fetch schedule exceptions', { error });
+      return res.status(500).json({ error: 'Failed to fetch exceptions' });
+    }
+
+    res.json({ data: data || [] });
+  } catch (error) {
+    logger.error('Get schedule exceptions error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create schedule exception (Admin only)
+router.post('/:studentId/schedule/exceptions', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    
+    const { error: validationError, value } = exceptionSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    // Verify student exists
+    const { data: student } = await supabase
+      .from('students')
+      .select('id')
+      .eq('id', studentId)
+      .single();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const { data, error } = await supabase
+      .from('student_schedule_exceptions')
+      .upsert({
+        student_id: studentId,
+        ...value
+      })
+      .select(`
+        *,
+        pickup_address:student_addresses!pickup_address_id(*),
+        pickup_time_slot:school_time_slots!pickup_time_slot_id(*),
+        dropoff_address:student_addresses!dropoff_address_id(*),
+        dropoff_time_slot:school_time_slots!dropoff_time_slot_id(*)
+      `)
+      .single();
+
+    if (error) {
+      logger.error('Failed to create schedule exception', { error });
+      return res.status(500).json({ error: 'Failed to create exception' });
+    }
+
+    logger.info('Schedule exception created', { 
+      studentId, 
+      exceptionId: data.id, 
+      date: value.exception_date,
+      userId: req.user.id 
+    });
+    
+    res.status(201).json({ data });
+  } catch (error) {
+    logger.error('Create schedule exception error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete schedule exception (Admin only)
+router.delete('/:studentId/schedule/exceptions/:exceptionId', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId, exceptionId } = req.params;
+
+    const { error } = await supabase
+      .from('student_schedule_exceptions')
+      .delete()
+      .eq('id', exceptionId)
+      .eq('student_id', studentId);
+
+    if (error) {
+      logger.error('Failed to delete schedule exception', { error });
+      return res.status(500).json({ error: 'Failed to delete exception' });
+    }
+
+    logger.info('Schedule exception deleted', { 
+      studentId, 
+      exceptionId, 
+      userId: req.user.id 
+    });
+    
+    res.json({ message: 'Exception deleted successfully' });
+  } catch (error) {
+    logger.error('Delete schedule exception error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update schedule exception (Admin only)
+router.put('/:studentId/schedule/exceptions/:exceptionId', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { studentId, exceptionId } = req.params;
+    
+    // Validate request body using the same schema as POST
+    const { error: validationError, value } = exceptionSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError.details[0].message });
+    }
+
+    // Verify student exists
+    const { data: studentData, error: studentError } = await supabase
+      .from('students')
+      .select('id')
+      .eq('id', studentId)
+      .single();
+
+    if (studentError || !studentData) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Update the exception
+    const { data, error } = await supabase
+      .from('student_schedule_exceptions')
+      .update({
+        ...value,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', exceptionId)
+      .eq('student_id', studentId)
+      .select();
+
+    if (error) {
+      logger.error('Failed to update schedule exception', { error });
+      return res.status(500).json({ error: 'Failed to update exception' });
+    }
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Exception not found' });
+    }
+
+    logger.info('Schedule exception updated', { 
+      studentId, 
+      exceptionId, 
+      exception_date: value.exception_date,
+      userId: req.user.id 
+    });
+    
+    res.json({ message: 'Exception updated successfully', data: data[0] });
+  } catch (error) {
+    logger.error('Update schedule exception error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== BULK SCHEDULE IMPORT/EXPORT ENDPOINTS ====================
+
+// Export student schedules template (Admin only)
+router.get('/schedules/template', authenticateToken, authorizeRoles(['admin']), (req, res) => {
+  const template = [
+    {
+      'student_name': 'Μαρία Παπαδοπούλου',
+      'student_id': '',
+      'day_of_week': '1',
+      'pickup_address_name': 'Σπίτι',
+      'pickup_time_slot': 'Κανονική Παραλαβή (08:00)',
+      'dropoff_address_name': 'Σπίτι',
+      'dropoff_time_slot': 'Κανονική Παράδοση (15:30)',
+      'notes': 'Παραδείγματα για Δευτέρα'
+    },
+    {
+      'student_name': 'Μαρία Παπαδοπούλου',
+      'student_id': '',
+      'day_of_week': '2',
+      'pickup_address_name': 'Σπίτι',
+      'pickup_time_slot': 'Κανονική Παραλαβή (08:00)',
+      'dropoff_address_name': 'Γιαγιά',
+      'dropoff_time_slot': 'Κανονική Παράδοση (15:30)',
+      'notes': 'Τρίτη πάει στη γιαγιά'
+    }
+  ];
+
+  const ws = xlsx.utils.json_to_sheet(template);
+  const wb = xlsx.utils.book_new();
+  xlsx.utils.book_append_sheet(wb, ws, 'Schedule Template');
+
+  const buffer = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename=student_schedule_template.xlsx');
+  res.send(buffer);
+});
+
+// Export all student schedules (Admin only)
+router.get('/schedules/export', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { data: students, error: studentsError } = await supabase
+      .from('students')
+      .select(`
+        id,
+        name,
+        grade,
+        parent:profiles!parent_id(full_name, email)
+      `)
+      .eq('is_active', true)
+      .order('name');
+
+    if (studentsError) {
+      logger.error('Failed to fetch students for schedule export', { error: studentsError });
+      return res.status(500).json({ error: 'Failed to fetch students' });
+    }
+
+    const { data: timeSlots, error: slotsError } = await supabase
+      .from('school_time_slots')
+      .select('*')
+      .eq('is_active', true);
+
+    if (slotsError) {
+      logger.error('Failed to fetch time slots for export', { error: slotsError });
+      return res.status(500).json({ error: 'Failed to fetch time slots' });
+    }
+
+    const exportData = [];
+
+    for (const student of students) {
+      const { data: schedules } = await supabase
+        .from('student_weekly_schedules')
+        .select(`
+          *,
+          pickup_address:student_addresses!pickup_address_id(address_name, street_name, street_number),
+          pickup_time_slot:school_time_slots!pickup_time_slot_id(slot_name, time_value),
+          dropoff_address:student_addresses!dropoff_address_id(address_name, street_name, street_number),
+          dropoff_time_slot:school_time_slots!dropoff_time_slot_id(slot_name, time_value)
+        `)
+        .eq('student_id', student.id)
+        .order('day_of_week');
+
+      const { data: addresses } = await supabase
+        .from('student_addresses')
+        .select('*')
+        .eq('student_id', student.id)
+        .eq('is_active', true);
+
+      for (let day = 1; day <= 5; day++) {
+        const daySchedule = schedules?.find(s => s.day_of_week === day) || {};
+        
+        exportData.push({
+          'student_name': student.name,
+          'student_id': student.id,
+          'student_grade': student.grade || '',
+          'parent_name': student.parent?.full_name || '',
+          'parent_email': student.parent?.email || '',
+          'day_of_week': day,
+          'day_name': DAYS_OF_WEEK.find(d => d.value === day)?.label || '',
+          'pickup_address_name': daySchedule.pickup_address?.address_name || 
+                                (daySchedule.pickup_address ? `${daySchedule.pickup_address.street_name} ${daySchedule.pickup_address.street_number}` : ''),
+          'pickup_time_slot': daySchedule.pickup_time_slot ? 
+                             `${daySchedule.pickup_time_slot.slot_name} (${daySchedule.pickup_time_slot.time_value?.substring(0, 5)})` : '',
+          'dropoff_address_name': daySchedule.dropoff_address?.address_name || 
+                                 (daySchedule.dropoff_address ? `${daySchedule.dropoff_address.street_name} ${daySchedule.dropoff_address.street_number}` : ''),
+          'dropoff_time_slot': daySchedule.dropoff_time_slot ? 
+                              `${daySchedule.dropoff_time_slot.slot_name} (${daySchedule.dropoff_time_slot.time_value?.substring(0, 5)})` : '',
+          'notes': daySchedule.notes || '',
+          'is_active': daySchedule.is_active ? 'Ναι' : 'Όχι'
+        });
+      }
+    }
+
+    const ws = xlsx.utils.json_to_sheet(exportData);
+    const wb = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(wb, ws, 'Student Schedules');
+
+    const buffer = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=student_schedules_export.xlsx');
+    res.send(buffer);
+
+    logger.info('Student schedules exported', { 
+      studentCount: students.length,
+      recordCount: exportData.length,
+      userId: req.user.id 
+    });
+
+  } catch (error) {
+    logger.error('Export schedules error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Import student schedules from CSV/Excel (Admin only)
+router.post('/schedules/import', authenticateToken, authorizeRoles(['admin']), upload.single('file'), async (req, res) => {
+  let filePath = null;
+  
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    filePath = req.file.path;
+    const fileExt = path.extname(req.file.originalname).toLowerCase();
+    let scheduleData = [];
+
+    if (fileExt === '.csv') {
+      const fileContent = await fs.readFile(filePath, 'utf-8');
+      const parser = csv.parse(fileContent, {
+        columns: true,
+        skip_empty_lines: true
+      });
+
+      for await (const record of parser) {
+        scheduleData.push(record);
+      }
+    } else if (fileExt === '.xlsx' || fileExt === '.xls') {
+      const workbook = xlsx.readFile(filePath);
+      const sheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[sheetName];
+      scheduleData = xlsx.utils.sheet_to_json(worksheet);
+    } else {
+      return res.status(400).json({ error: 'Unsupported file format' });
+    }
+
+    const results = {
+      successful: 0,
+      failed: 0,
+      errors: []
+    };
+
+    // Get all time slots and students for reference
+    const { data: timeSlots } = await supabase
+      .from('school_time_slots')
+      .select('*')
+      .eq('is_active', true);
+
+    const { data: students } = await supabase
+      .from('students')
+      .select('id, name')
+      .eq('is_active', true);
+
+    for (const row of scheduleData) {
+      try {
+        // Find student by name or ID
+        const studentName = row.student_name || row['student_name'] || row['Όνομα Μαθητή'];
+        const studentId = row.student_id || row['student_id'] || row['Κωδικός Μαθητή'];
+        
+        let student = null;
+        if (studentId) {
+          student = students.find(s => s.id === studentId);
+        }
+        if (!student && studentName) {
+          student = students.find(s => s.name.toLowerCase() === studentName.toLowerCase());
+        }
+
+        if (!student) {
+          results.failed++;
+          results.errors.push({
+            row: results.successful + results.failed,
+            error: `Μαθητής δεν βρέθηκε: ${studentName || studentId}`,
+            data: row
+          });
+          continue;
+        }
+
+        // Parse day of week
+        const dayOfWeek = parseInt(row.day_of_week || row['day_of_week'] || row['Ημέρα']);
+        if (isNaN(dayOfWeek) || dayOfWeek < 1 || dayOfWeek > 5) {
+          results.failed++;
+          results.errors.push({
+            row: results.successful + results.failed,
+            error: `Μη έγκυρη ημέρα εβδομάδας: ${row.day_of_week}`,
+            data: row
+          });
+          continue;
+        }
+
+        // Get student addresses
+        const { data: addresses } = await supabase
+          .from('student_addresses')
+          .select('*')
+          .eq('student_id', student.id)
+          .eq('is_active', true);
+
+        // Find pickup address
+        const pickupAddressName = row.pickup_address_name || row['pickup_address_name'] || row['Διεύθυνση Παραλαβής'];
+        let pickupAddressId = null;
+        if (pickupAddressName) {
+          const pickupAddr = addresses?.find(addr => 
+            addr.address_name?.toLowerCase() === pickupAddressName.toLowerCase() ||
+            `${addr.street_name} ${addr.street_number}`.toLowerCase() === pickupAddressName.toLowerCase()
+          );
+          pickupAddressId = pickupAddr?.id;
+        }
+
+        // Find dropoff address
+        const dropoffAddressName = row.dropoff_address_name || row['dropoff_address_name'] || row['Διεύθυνση Παράδοσης'];
+        let dropoffAddressId = null;
+        if (dropoffAddressName) {
+          const dropoffAddr = addresses?.find(addr => 
+            addr.address_name?.toLowerCase() === dropoffAddressName.toLowerCase() ||
+            `${addr.street_name} ${addr.street_number}`.toLowerCase() === dropoffAddressName.toLowerCase()
+          );
+          dropoffAddressId = dropoffAddr?.id;
+        }
+
+        // Find pickup time slot
+        const pickupTimeSlot = row.pickup_time_slot || row['pickup_time_slot'] || row['Ώρα Παραλαβής'];
+        let pickupTimeSlotId = null;
+        if (pickupTimeSlot) {
+          const slot = timeSlots?.find(ts => 
+            ts.slot_type === 'pickup' && (
+              ts.slot_name.toLowerCase().includes(pickupTimeSlot.toLowerCase()) ||
+              pickupTimeSlot.toLowerCase().includes(ts.slot_name.toLowerCase()) ||
+              pickupTimeSlot.includes(ts.time_value?.substring(0, 5))
+            )
+          );
+          pickupTimeSlotId = slot?.id;
+        }
+
+        // Find dropoff time slot
+        const dropoffTimeSlot = row.dropoff_time_slot || row['dropoff_time_slot'] || row['Ώρα Παράδοσης'];
+        let dropoffTimeSlotId = null;
+        if (dropoffTimeSlot) {
+          const slot = timeSlots?.find(ts => 
+            ts.slot_type === 'dropoff' && (
+              ts.slot_name.toLowerCase().includes(dropoffTimeSlot.toLowerCase()) ||
+              dropoffTimeSlot.toLowerCase().includes(ts.slot_name.toLowerCase()) ||
+              dropoffTimeSlot.includes(ts.time_value?.substring(0, 5))
+            )
+          );
+          dropoffTimeSlotId = slot?.id;
+        }
+
+        // Create/update schedule
+        const scheduleData = {
+          student_id: student.id,
+          day_of_week: dayOfWeek,
+          pickup_address_id: pickupAddressId,
+          pickup_time_slot_id: pickupTimeSlotId,
+          dropoff_address_id: dropoffAddressId,
+          dropoff_time_slot_id: dropoffTimeSlotId,
+          notes: row.notes || row['notes'] || row['Σημειώσεις'] || '',
+          is_active: true
+        };
+
+        const { error: scheduleError } = await supabase
+          .from('student_weekly_schedules')
+          .upsert(scheduleData);
+
+        if (scheduleError) {
+          results.failed++;
+          results.errors.push({
+            row: results.successful + results.failed,
+            error: `Σφάλμα αποθήκευσης προγράμματος: ${scheduleError.message}`,
+            data: row
+          });
+          continue;
+        }
+
+        results.successful++;
+
+      } catch (error) {
+        results.failed++;
+        results.errors.push({
+          row: results.successful + results.failed,
+          error: error.message,
+          data: row
+        });
+      }
+    }
+
+    logger.info('Schedule import completed', { 
+      successful: results.successful, 
+      failed: results.failed,
+      userId: req.user.id 
+    });
+
+    res.json({
+      message: 'Import completed',
+      results
+    });
+
+  } catch (error) {
+    logger.error('Import schedules error', { error: error.message });
+    res.status(500).json({ error: 'Import failed' });
+  } finally {
+    if (filePath) {
+      try {
+        await fs.unlink(filePath);
+      } catch (err) {
+        logger.error('Failed to delete uploaded file', { error: err });
+      }
+    }
   }
 });
 

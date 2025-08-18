@@ -4,6 +4,7 @@ const winston = require('winston');
 const { createClient } = require('@supabase/supabase-js');
 const Joi = require('joi');
 const { authenticateToken, authorizeRoles } = require('../auth/middleware');
+const { getCurrentDate, getCurrentTimestamp, toDateString } = require('../../shared/utils/dateUtils');
 
 // Initialize logger
 const logger = winston.createLogger({
@@ -46,8 +47,8 @@ const reportSchema = Joi.object({
 // Overview endpoint for Reports page
 router.get('/overview', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
   try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const todayString = getCurrentDate();
+    const today = new Date(todayString + 'T00:00:00.000Z');
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 

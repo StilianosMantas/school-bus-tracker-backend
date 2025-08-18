@@ -37,6 +37,7 @@ app.get('/health', (req, res) => {
 
 // Routes
 app.use('/', require('./routes'));
+app.use('/admin', require('./cacheRoutes'));
 
 // Error handling middleware
 app.use((err, req, res, next) => {

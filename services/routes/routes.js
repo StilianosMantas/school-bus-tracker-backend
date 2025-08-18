@@ -292,6 +292,42 @@ router.get('/buses', authenticateToken, authorizeRoles(['admin', 'dispatcher']),
   }
 });
 
+// Get all stops from all routes (aggregated endpoint)
+router.get('/stops', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('stops')
+      .select(`
+        *,
+        routes(id, name, type, is_active)
+      `)
+      .eq('routes.is_active', true)
+      .order('routes.name')
+      .order('stop_order');
+
+    if (error) {
+      logger.error('Failed to fetch all stops', { error });
+      return res.status(500).json({ error: 'Failed to fetch stops' });
+    }
+
+    // Add route info to each stop for better context
+    const stopsWithRoute = (data || []).map(stop => ({
+      ...stop,
+      route: {
+        id: stop.routes?.id,
+        name: stop.routes?.name,
+        type: stop.routes?.type,
+        is_active: stop.routes?.is_active
+      }
+    }));
+
+    res.json({ data: stopsWithRoute });
+  } catch (error) {
+    logger.error('Get all stops error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get all routes
 router.get('/', authenticateToken, async (req, res) => {
   try {

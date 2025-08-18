@@ -5,7 +5,7 @@ const path = require('path');
 // Load environment variables
 dotenv.config({ path: path.join(__dirname, '../../../.env') });
 
-// Create Supabase client
+// Create Supabase client with optimized settings
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY,
@@ -13,6 +13,14 @@ const supabase = createClient(
     auth: {
       autoRefreshToken: true,
       persistSession: false
+    },
+    db: {
+      schema: 'public'
+    },
+    global: {
+      headers: {
+        'x-client-info': 'bus-tracker-backend'
+      }
     }
   }
 );
