@@ -352,10 +352,29 @@ router.put('/users/:id', authenticateToken, authorizeRoles(['admin']), async (re
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['full_name', 'phone', 'role'];
+    const allowedFields = [
+      'full_name', 
+      'phone', 
+      'role',
+      'street_address',
+      'street_name', 
+      'street_number',
+      'city',
+      'postal_code',
+      'country',
+      'latitude',
+      'longitude'
+    ];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
-        updates[field] = req.body[field];
+        let value = req.body[field];
+        
+        // Handle numeric fields - convert empty strings to null
+        if ((field === 'latitude' || field === 'longitude') && value === '') {
+          value = null;
+        }
+        
+        updates[field] = value;
       }
     });
 

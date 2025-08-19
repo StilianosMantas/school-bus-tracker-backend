@@ -739,7 +739,8 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 router.post('/incidents', authenticateToken, authorizeRoles(['driver', 'escort', 'admin']), async (req, res) => {
   try {
     const incidentSchema = Joi.object({
-      schedule_id: Joi.string().uuid().required(),
+      schedule_id: Joi.string().uuid().allow(null, '').optional(),
+      route_id: Joi.string().uuid().allow(null, '').optional(),
       type: Joi.string().valid('mechanical', 'accident', 'behavior', 'traffic', 'weather', 'medical', 'other').required(),
       severity: Joi.string().valid('low', 'medium', 'high', 'critical').required(),
       description: Joi.string().required(),
@@ -754,40 +755,85 @@ router.post('/incidents', authenticateToken, authorizeRoles(['driver', 'escort',
       return res.status(400).json({ error: validationError.details[0].message });
     }
 
-    // Verify schedule exists and user authorization
-    const { data: schedule, error: scheduleError } = await supabase
-      .from('schedules')
-      .select('*, routes(*), buses(*)')
-      .eq('id', value.schedule_id)
-      .single();
+    let schedule = null;
+    let route = null;
+    
+    // Validate that both schedule_id and route_id are not provided at the same time
+    if (value.schedule_id && value.route_id) {
+      return res.status(400).json({ error: 'Cannot specify both schedule_id and route_id' });
+    }
+    
+    // Verify schedule exists and user authorization (only if schedule_id is provided)
+    if (value.schedule_id) {
+      const { data: scheduleData, error: scheduleError } = await supabase
+        .from('schedules')
+        .select('*, routes(*), buses(*)')
+        .eq('id', value.schedule_id)
+        .single();
 
-    if (scheduleError || !schedule) {
-      logger.warn('Schedule not found for incident report', { 
-        userId: req.user.id, 
-        scheduleId: value.schedule_id,
-        error: scheduleError 
-      });
-      return res.status(404).json({ error: 'Schedule not found' });
+      if (scheduleError || !scheduleData) {
+        logger.warn('Schedule not found for incident report', { 
+          userId: req.user.id, 
+          scheduleId: value.schedule_id,
+          error: scheduleError 
+        });
+        return res.status(404).json({ error: 'Schedule not found' });
+      }
+
+      schedule = scheduleData;
+
+      // For drivers, verify they are assigned to this schedule
+      // For admins, allow creating incidents for any schedule
+      if (req.user.role === 'driver' && schedule.driver_id !== req.user.id) {
+        logger.warn('Unauthorized incident report attempt', { 
+          driverId: req.user.id, 
+          scheduleId: value.schedule_id 
+        });
+        return res.status(403).json({ error: 'Not authorized for this schedule' });
+      }
+    }
+    
+    // Verify route exists (if route_id is provided)
+    if (value.route_id) {
+      const { data: routeData, error: routeError } = await supabase
+        .from('routes')
+        .select('*')
+        .eq('id', value.route_id)
+        .single();
+
+      if (routeError || !routeData) {
+        logger.warn('Route not found for incident report', { 
+          userId: req.user.id, 
+          routeId: value.route_id,
+          error: routeError 
+        });
+        return res.status(404).json({ error: 'Route not found' });
+      }
+
+      route = routeData;
+
+      // For drivers, verify they are assigned to this route
+      // For admins, allow creating incidents for any route
+      if (req.user.role === 'driver' && route.driver_id !== req.user.id) {
+        logger.warn('Unauthorized incident report attempt', { 
+          driverId: req.user.id, 
+          routeId: value.route_id 
+        });
+        return res.status(403).json({ error: 'Not authorized for this route' });
+      }
     }
 
-    // For drivers, verify they are assigned to this schedule
-    // For admins, allow creating incidents for any schedule
-    if (req.user.role === 'driver' && schedule.driver_id !== req.user.id) {
-      logger.warn('Unauthorized incident report attempt', { 
-        driverId: req.user.id, 
-        scheduleId: value.schedule_id 
-      });
-      return res.status(403).json({ error: 'Not authorized for this schedule' });
-    }
-
-    // Create incident record with derived fields from schedule
+    // Create incident record with derived fields from schedule or route
     const { data: incident, error: incidentError } = await supabase
       .from('incidents')
       .insert({
         ...value,
-        driver_id: req.user.role === 'driver' ? req.user.id : schedule.driver_id,
-        route_id: schedule.route_id,
-        bus_id: schedule.bus_id,
+        schedule_id: value.schedule_id || null,
+        route_id: value.route_id || (schedule ? schedule.route_id : null),
+        driver_id: schedule ? (req.user.role === 'driver' ? req.user.id : schedule.driver_id) : 
+                   route ? (req.user.role === 'driver' ? req.user.id : route.driver_id) : 
+                   req.user.id,
+        bus_id: schedule ? schedule.bus_id : (route ? route.bus_id : null),
         status: 'open',
         reported_at: new Date().toISOString()
       })
@@ -813,8 +859,8 @@ router.post('/incidents', authenticateToken, authorizeRoles(['driver', 'escort',
       trackingEvents.emit('critical-incident', {
         incident,
         driverId: req.user.id,
-        routeId: schedule.route_id,
-        busId: schedule.bus_id
+        routeId: schedule ? schedule.route_id : (route ? route.id : null),
+        busId: schedule ? schedule.bus_id : (route ? route.bus_id : null)
       });
     }
 
