@@ -592,7 +592,7 @@ router.get('/route/:routeId', authenticateToken, authorizeRoles(['admin', 'dispa
 });
 
 // Get students for a specific route and stop (Driver/Admin only)
-router.get('/route/:routeId/stop/:stopId', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+router.get('/route/:routeId/stop/:stopId', authenticateToken, authorizeRoles(['driver', 'escort', 'admin', 'dispatcher']), async (req, res) => {
   try {
     const { routeId, stopId } = req.params;
 
@@ -652,7 +652,7 @@ router.get('/route/:routeId/stop/:stopId', authenticateToken, authorizeRoles(['d
 });
 
 // Get students by stop (Driver/Admin only)
-router.get('/stop/:stopId', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+router.get('/stop/:stopId', authenticateToken, authorizeRoles(['driver', 'escort', 'admin', 'dispatcher']), async (req, res) => {
   try {
     const { stopId } = req.params;
 
@@ -1038,7 +1038,7 @@ router.post('/:studentId/assign-stop', authenticateToken, authorizeRoles(['admin
 });
 
 // Batch save attendance (Driver only)
-router.post('/attendance/batch', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
+router.post('/attendance/batch', authenticateToken, authorizeRoles(['driver', 'escort']), async (req, res) => {
   try {
     const { attendance } = req.body;
 
@@ -1217,7 +1217,7 @@ router.get('/parent/:parentId', authenticateToken, authorizeRoles(['parent', 'ad
 });
 
 // Get single student details (for parent)
-router.get('/:studentId', authenticateToken, authorizeRoles(['parent', 'admin', 'driver']), async (req, res) => {
+router.get('/:studentId', authenticateToken, authorizeRoles(['parent', 'admin', 'driver', 'escort']), async (req, res) => {
   try {
     const { studentId } = req.params;
 

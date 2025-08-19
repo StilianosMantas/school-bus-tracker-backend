@@ -32,7 +32,7 @@ router.get('/health', (req, res) => {
 });
 
 // Get driver's trip history
-router.get('/driver-trips', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
+router.get('/driver-trips', authenticateToken, authorizeRoles(['driver', 'escort']), async (req, res) => {
   try {
     const { start_date, end_date } = req.query;
     const driverId = req.user.id;
@@ -166,7 +166,7 @@ router.post('/bulk', authenticateToken, authorizeRoles(['driver']), async (req, 
 });
 
 // Submit GPS location (Driver only)
-router.post('/location', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
+router.post('/location', authenticateToken, authorizeRoles(['driver', 'escort']), async (req, res) => {
   try {
     const { error: validationError, value } = gpsSchema.validate(req.body);
     if (validationError) {
@@ -523,7 +523,7 @@ router.get('/admin-updates', async (req, res) => {
 });
 
 // Start trip (Driver only)
-router.post('/start-trip', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
+router.post('/start-trip', authenticateToken, authorizeRoles(['driver', 'escort']), async (req, res) => {
   try {
     const { scheduleId, routeId, busId } = req.body;
     const today = new Date().toISOString().split('T')[0];
@@ -669,7 +669,7 @@ router.post('/start-trip', authenticateToken, authorizeRoles(['driver']), async 
 });
 
 // End trip (Driver only)
-router.post('/end-trip', authenticateToken, authorizeRoles(['driver']), async (req, res) => {
+router.post('/end-trip', authenticateToken, authorizeRoles(['driver', 'escort']), async (req, res) => {
   try {
     const { scheduleId } = req.body;
 
@@ -736,7 +736,7 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 }
 
 // Report incident (Driver and Admin)
-router.post('/incidents', authenticateToken, authorizeRoles(['driver', 'admin']), async (req, res) => {
+router.post('/incidents', authenticateToken, authorizeRoles(['driver', 'escort', 'admin']), async (req, res) => {
   try {
     const incidentSchema = Joi.object({
       schedule_id: Joi.string().uuid().required(),
@@ -898,7 +898,7 @@ router.get('/schedules', authenticateToken, authorizeRoles(['admin', 'dispatcher
 });
 
 // Get incidents for admin/dispatcher/driver
-router.get('/incidents', authenticateToken, authorizeRoles(['admin', 'dispatcher', 'driver']), async (req, res) => {
+router.get('/incidents', authenticateToken, authorizeRoles(['admin', 'dispatcher', 'driver', 'escort']), async (req, res) => {
   try {
     const { status, severity, type, date, driver_id } = req.query;
     
@@ -1001,7 +1001,7 @@ router.get('/route-progress', authenticateToken, async (req, res) => {
 });
 
 // Start a route
-router.post('/route-progress/:route_id/start', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+router.post('/route-progress/:route_id/start', authenticateToken, authorizeRoles(['driver', 'escort', 'admin', 'dispatcher']), async (req, res) => {
   try {
     const { route_id } = req.params;
     const { current_location, schedule_id } = req.body;
@@ -1053,7 +1053,7 @@ router.post('/route-progress/:route_id/start', authenticateToken, authorizeRoles
 });
 
 // Update route location and progress
-router.put('/route-progress/:id/location', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+router.put('/route-progress/:id/location', authenticateToken, authorizeRoles(['driver', 'escort', 'admin', 'dispatcher']), async (req, res) => {
   try {
     const { id } = req.params;
     const { current_location, current_stop_id } = req.body;
@@ -1087,7 +1087,7 @@ router.put('/route-progress/:id/location', authenticateToken, authorizeRoles(['d
 });
 
 // Record student boarding/offboarding
-router.post('/route-progress/:id/student-boarding', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+router.post('/route-progress/:id/student-boarding', authenticateToken, authorizeRoles(['driver', 'escort', 'admin', 'dispatcher']), async (req, res) => {
   try {
     const { id: route_progress_id } = req.params;
     const { student_name, stop_id, action, notes } = req.body;
@@ -1147,7 +1147,7 @@ router.post('/route-progress/:id/student-boarding', authenticateToken, authorize
 });
 
 // Complete a route
-router.put('/route-progress/:id/complete', authenticateToken, authorizeRoles(['driver', 'admin', 'dispatcher']), async (req, res) => {
+router.put('/route-progress/:id/complete', authenticateToken, authorizeRoles(['driver', 'escort', 'admin', 'dispatcher']), async (req, res) => {
   try {
     const { id } = req.params;
     const { final_location } = req.body;

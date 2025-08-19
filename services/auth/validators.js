@@ -10,8 +10,21 @@ const signupSchema = Joi.object({
   email: Joi.string().email().required(),
   password: Joi.string().min(6).required(),
   fullName: Joi.string().min(2).max(100).required(),
-  role: Joi.string().valid('parent', 'driver', 'admin', 'dispatcher').required(),
-  phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).optional()
+  role: Joi.string().valid('parent', 'driver', 'admin', 'dispatcher', 'escort').required(),
+  phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).optional(),
+  // Address fields (required for drivers and escorts)
+  street_address: Joi.string().when('role', {
+    is: Joi.string().valid('driver', 'escort'),
+    then: Joi.required(),
+    otherwise: Joi.optional()
+  }),
+  city: Joi.string().default('Αθήνα').optional(),
+  postal_code: Joi.string().when('role', {
+    is: Joi.string().valid('driver', 'escort'),
+    then: Joi.required(),
+    otherwise: Joi.optional()
+  }),
+  country: Joi.string().default('Ελλάδα').optional()
 });
 
 // Validation middleware

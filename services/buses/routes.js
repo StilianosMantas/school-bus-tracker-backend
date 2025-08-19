@@ -57,7 +57,7 @@ router.get('/', authenticateToken, authorizeRoles(['admin', 'dispatcher']), asyn
 });
 
 // Get bus by ID
-router.get('/:id', authenticateToken, authorizeRoles(['admin', 'dispatcher', 'driver']), async (req, res) => {
+router.get('/:id', authenticateToken, authorizeRoles(['admin', 'dispatcher', 'driver', 'escort']), async (req, res) => {
   try {
     const { id } = req.params;
 

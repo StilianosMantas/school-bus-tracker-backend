@@ -18,6 +18,7 @@ const routeSchema = Joi.object({
   route_direction: Joi.string().valid('pickup', 'dropoff', 'circular').default('pickup'),
   is_active: Joi.boolean().default(true),
   driver_id: Joi.string().uuid().allow(null).optional(),
+  escort_id: Joi.string().uuid().allow(null).optional(),
   bus_id: Joi.string().uuid().allow(null).optional()
 });
 
@@ -272,6 +273,27 @@ router.get('/drivers', authenticateToken, authorizeRoles(['admin', 'dispatcher']
   }
 });
 
+// Get all escorts for assignment (Admin only)
+router.get('/escorts', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, full_name, email, phone')
+      .eq('role', 'escort')
+      .order('full_name');
+
+    if (error) {
+      logger.error('Failed to fetch escorts', { error });
+      return res.status(500).json({ error: 'Failed to fetch escorts' });
+    }
+
+    res.json({ data });
+  } catch (error) {
+    logger.error('Get escorts error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get all buses for assignment (Admin only)
 router.get('/buses', authenticateToken, authorizeRoles(['admin', 'dispatcher']), async (req, res) => {
   try {
@@ -339,6 +361,7 @@ router.get('/', authenticateToken, async (req, res) => {
         *,
         stops(*),
         driver:profiles!driver_id(id, full_name, email, phone),
+        escort:profiles!escort_id(id, full_name, email, phone),
         bus:buses!bus_id(id, bus_number, capacity, status)
       `)
       .order('name');
@@ -832,6 +855,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
         *,
         stops(*),
         driver:profiles!driver_id(id, full_name, email, phone),
+        escort:profiles!escort_id(id, full_name, email, phone),
         bus:buses!bus_id(id, bus_number, capacity, status)
       `)
       .eq('id', id)
@@ -892,7 +916,7 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['name', 'description', 'type', 'is_active', 'driver_id', 'bus_id'];
+    const allowedFields = ['name', 'description', 'type', 'is_active', 'driver_id', 'escort_id', 'bus_id'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];
