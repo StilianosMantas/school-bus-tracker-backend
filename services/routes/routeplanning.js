@@ -22,22 +22,139 @@ function toCoordString(lat, lon) {
   return `${Number(lat).toFixed(6)},${Number(lon).toFixed(6)}`;
 }
 
-function buildTomTomPath({ school, students, stops = [] }) {
-  const parts = [toCoordString(school.lat, school.lon)];
+// Find the furthest student from school using Haversine distance
+function findFurthestStudent(students, school) {
+  if (!students || students.length === 0) return null;
   
-  // Add route stops if provided
-  if (stops && stops.length > 0) {
-    stops.forEach(stop => {
-      if (stop.latitude && stop.longitude) {
-        parts.push(toCoordString(stop.latitude, stop.longitude));
+  let furthestStudent = null;
+  let maxDistance = 0;
+  
+  students.forEach(student => {
+    const distance = hav(school, { lat: student.lat, lon: student.lon });
+    if (distance > maxDistance) {
+      maxDistance = distance;
+      furthestStudent = student;
+    }
+  });
+  
+  return furthestStudent;
+}
+
+function buildTomTomPath({ school, students, stops = [], routeType = 'pickup' }) {
+  const parts = [];
+  
+  // Filter out students without valid coordinates
+  const validStudents = students.filter(s => {
+    const lat = s.lat;
+    const lon = s.lon;
+    
+    // Check for null, undefined, empty string, 0, or NaN values
+    if (lat == null || lon == null || 
+        lat === '' || lon === '' ||
+        lat === 0 || lon === 0 ||
+        isNaN(Number(lat)) || isNaN(Number(lon))) {
+      console.warn(`Student ${s.id} (${s.name}) has invalid coordinates: lat=${lat}, lon=${lon}`);
+      return false;
+    }
+    
+    // Additional check for realistic coordinate ranges
+    const numLat = Number(lat);
+    const numLon = Number(lon);
+    
+    if (numLat < -90 || numLat > 90 || numLon < -180 || numLon > 180) {
+      console.warn(`Student ${s.id} (${s.name}) has out-of-range coordinates: lat=${numLat}, lon=${numLon}`);
+      return false;
+    }
+    
+    return true;
+  });
+  
+  if (validStudents.length !== students.length) {
+    console.warn(`Filtered out ${students.length - validStudents.length} students with invalid coordinates`);
+  }
+  
+  // For pickup routes: Start from furthest student, end at school
+  // For dropoff routes: Start from school, end at furthest student
+  
+  if (routeType === 'pickup') {
+    // Find the furthest student to start the route
+    const furthestStudent = findFurthestStudent(validStudents, school);
+    console.log(`PICKUP ROUTE: Found furthest student: ${furthestStudent?.name} at ${furthestStudent?.lat}, ${furthestStudent?.lon}`);
+    
+    if (furthestStudent) {
+      // Start from the furthest student
+      parts.push(toCoordString(furthestStudent.lat, furthestStudent.lon));
+      console.log(`PICKUP ROUTE: Starting from furthest student ${furthestStudent.name}`);
+      
+      // Add other students (TomTom will optimize the order between them)
+      validStudents.forEach(s => {
+        if (s.id !== furthestStudent.id) {
+          parts.push(toCoordString(s.lat, s.lon));
+        }
+      });
+      
+      // Add route stops if provided
+      if (stops && stops.length > 0) {
+        stops.forEach(stop => {
+          if (stop.latitude && stop.longitude) {
+            parts.push(toCoordString(stop.latitude, stop.longitude));
+          }
+        });
       }
+      
+      // End at school
+      parts.push(toCoordString(school.lat, school.lon));
+    } else {
+      // Fallback if no students
+      parts.push(toCoordString(school.lat, school.lon));
+    }
+    
+  } else if (routeType === 'dropoff') {
+    // Start from school
+    parts.push(toCoordString(school.lat, school.lon));
+    
+    // Add route stops if provided
+    if (stops && stops.length > 0) {
+      stops.forEach(stop => {
+        if (stop.latitude && stop.longitude) {
+          parts.push(toCoordString(stop.latitude, stop.longitude));
+        }
+      });
+    }
+    
+    // Find the furthest student to end the route
+    const furthestStudent = findFurthestStudent(validStudents, school);
+    
+    if (furthestStudent) {
+      // Add other students first (TomTom will optimize the order)
+      validStudents.forEach(s => {
+        if (s.id !== furthestStudent.id) {
+          parts.push(toCoordString(s.lat, s.lon));
+        }
+      });
+      
+      // End at the furthest student
+      parts.push(toCoordString(furthestStudent.lat, furthestStudent.lon));
+    }
+  } else {
+    // Default behavior (mixed or unknown route type)
+    parts.push(toCoordString(school.lat, school.lon));
+    
+    if (stops && stops.length > 0) {
+      stops.forEach(stop => {
+        if (stop.latitude && stop.longitude) {
+          parts.push(toCoordString(stop.latitude, stop.longitude));
+        }
+      });
+    }
+    
+    validStudents.forEach(s => {
+      parts.push(toCoordString(s.lat, s.lon));
     });
   }
   
-  // Add student locations
-  students.forEach(s => {
-    parts.push(toCoordString(s.lat, s.lon));
-  });
+  console.log(`Built ${routeType} route path with ${parts.length} waypoints`);
+  console.log('Route waypoints order:', parts);
   
   return parts.join(":");
 }
@@ -140,7 +257,7 @@ function buildBusClusters({ school, students, buses }) {
   }));
 }
 
-async function routeBusTomTom({ apiKey, school, students, stops = [], traffic = false, departAt, arriveAt, avoidTolls = false, timeout = 60000, baseUrl = "https://api.tomtom.com" }) {
+async function routeBusTomTom({ apiKey, school, students, stops = [], traffic = false, departAt, arriveAt, avoidTolls = false, timeout = 60000, baseUrl = "https://api.tomtom.com", routeType = 'pickup' }) {
   console.log('=== TOMTOM routeBusTomTom FUNCTION ===');
   console.log('School:', school);
   console.log('Students count:', students.length);
@@ -148,8 +265,36 @@ async function routeBusTomTom({ apiKey, school, students, stops = [], traffic = 
   console.log('Stops count:', stops.length);
   console.log('Stops:', stops);
   
-  const path = buildTomTomPath({ school, students, stops });
+  const path = buildTomTomPath({ school, students, stops, routeType });
   console.log('Built TomTom path:', path);
+  
+  // Get the same validStudents that buildTomTomPath uses
+  const validStudents = students.filter(s => {
+    const lat = s.lat;
+    const lon = s.lon;
+    
+    if (lat == null || lon == null || 
+        lat === '' || lon === '' ||
+        lat === 0 || lon === 0 ||
+        isNaN(Number(lat)) || isNaN(Number(lon))) {
+      return false;
+    }
+    
+    const numLat = Number(lat);
+    const numLon = Number(lon);
+    
+    if (numLat < -90 || numLat > 90 || numLon < -180 || numLon > 180) {
+      return false;
+    }
+    
+    return true;
+  });
+  
+  console.log(`=== STUDENT FILTERING DEBUG ===`);
+  console.log(`Original students: ${students.length}`);
+  console.log(`Valid students after filtering: ${validStudents.length}`);
+  console.log(`Route type: ${routeType}`);
+  console.log(`Valid students:`, validStudents.map(s => ({ id: s.id, name: s.name, lat: s.lat, lon: s.lon })));
   
   const url = `${baseUrl}/routing/1/calculateRoute/${path}/json`;
   const params = {
@@ -178,37 +323,130 @@ async function routeBusTomTom({ apiKey, school, students, stops = [], traffic = 
   console.log('Status:', res.status);
   console.log('Response data keys:', Object.keys(res.data));
   
-  // Build original waypoints array in the order they were sent to TomTom
+  // Build original waypoints array in the EXACT order they were sent to TomTom
   const originalWaypoints = [];
   
-  // Add school as first waypoint
-  originalWaypoints.push({
-    type: 'school',
-    data: school,
-    id: 'school'
-  });
-  
-  // Add stops
-  if (stops && stops.length > 0) {
-    stops.forEach((stop, index) => {
+  // Reconstruct the order based on routeType (must match buildTomTomPath logic EXACTLY)
+  if (routeType === 'pickup') {
+    const furthestStudent = findFurthestStudent(validStudents, school);
+    
+    if (furthestStudent) {
+      // Start from the furthest student
       originalWaypoints.push({
-        type: 'stop',
-        data: stop,
-        id: stop.id || `stop_${index}`
+        type: 'student',
+        data: furthestStudent,
+        id: furthestStudent.id
+      });
+      
+      // Add other students (only those that are NOT the furthest student)
+      const otherStudents = validStudents.filter(s => s.id !== furthestStudent.id);
+      otherStudents.forEach(s => {
+        originalWaypoints.push({
+          type: 'student',
+          data: s,
+          id: s.id
+        });
+      });
+      
+      // Add route stops (if they have valid coordinates)
+      if (stops && stops.length > 0) {
+        stops.forEach((stop, index) => {
+          if (stop.latitude && stop.longitude) {
+            originalWaypoints.push({
+              type: 'stop',
+              data: stop,
+              id: stop.id || `stop_${index}`
+            });
+          }
+        });
+      }
+      
+      // End at school
+      originalWaypoints.push({
+        type: 'school',
+        data: school,
+        id: 'school'
+      });
+    } else {
+      // Fallback if no students - just school
+      originalWaypoints.push({
+        type: 'school',
+        data: school,
+        id: 'school'
+      });
+    }
+  } else if (routeType === 'dropoff') {
+    // Start from school
+    originalWaypoints.push({
+      type: 'school',
+      data: school,
+      id: 'school'
+    });
+    
+    // Add stops
+    if (stops && stops.length > 0) {
+      stops.forEach((stop, index) => {
+        originalWaypoints.push({
+          type: 'stop',
+          data: stop,
+          id: stop.id || `stop_${index}`
+        });
+      });
+    }
+    
+    const furthestStudent = findFurthestStudent(validStudents, school);
+    
+    if (furthestStudent) {
+      // Add other students first
+      validStudents.forEach(s => {
+        if (s.id !== furthestStudent.id) {
+          originalWaypoints.push({
+            type: 'student',
+            data: s,
+            id: s.id
+          });
+        }
+      });
+      
+      // End at furthest student
+      originalWaypoints.push({
+        type: 'student',
+        data: furthestStudent,
+        id: furthestStudent.id
+      });
+    }
+  } else {
+    // Default/mixed - use original order
+    originalWaypoints.push({
+      type: 'school',
+      data: school,
+      id: 'school'
+    });
+    
+    if (stops && stops.length > 0) {
+      stops.forEach((stop, index) => {
+        originalWaypoints.push({
+          type: 'stop',
+          data: stop,
+          id: stop.id || `stop_${index}`
+        });
+      });
+    }
+    
+    validStudents.forEach(student => {
+      originalWaypoints.push({
+        type: 'student',
+        data: student,
+        id: student.id
       });
     });
   }
   
-  // Add students
-  students.forEach(student => {
-    originalWaypoints.push({
-      type: 'student',
-      data: student,
-      id: student.id
-    });
-  });
-  
-  console.log('Original waypoints sent to TomTom:', originalWaypoints);
+  console.log('=== WAYPOINT RECONSTRUCTION DEBUG ===');
+  console.log('TomTom path parts:', path.split(':').length);
+  console.log('Original waypoints reconstructed:', originalWaypoints.length);
+  console.log('Waypoints detail:', originalWaypoints.map(w => ({ type: w.type, id: w.id })));
+  console.log('=== END DEBUG ===');
   
   // Use the extraction function to get optimized route
   const extractedRoute = extractOptimizedRoute(res.data, originalWaypoints);
@@ -248,21 +486,21 @@ async function routeBusTomTom({ apiKey, school, students, stops = [], traffic = 
   return result;
 }
 
-function buildBatchItem({ apiKey, school, clusterStudents, stops = [], traffic = false, departAt, arriveAt, baseUrl }) {
-  const path = buildTomTomPath({ school, students: clusterStudents, stops });
+function buildBatchItem({ apiKey, school, clusterStudents, stops = [], traffic = false, departAt, arriveAt, baseUrl, routeType = 'pickup' }) {
+  const path = buildTomTomPath({ school, students: clusterStudents, stops, routeType });
   const base = `/routing/1/calculateRoute/${path}/json?key=${encodeURIComponent(apiKey)}&computeBestOrder=true&routeType=fastest&traffic=${traffic ? "true" : "false"}`;
   const q = departAt ? `${base}&departAt=${encodeURIComponent(departAt)}` : arriveAt ? `${base}&arriveAt=${encodeURIComponent(arriveAt)}` : base;
   return { query: q, method: "GET", headers: [], body: "" };
 }
 
-async function batchRouteTomTom({ apiKey, school, busClusters, stops = [], traffic = false, departAt, arriveAt, timeout = 120000, baseUrl = "https://api.tomtom.com" }) {
+async function batchRouteTomTom({ apiKey, school, busClusters, stops = [], traffic = false, departAt, arriveAt, timeout = 120000, baseUrl = "https://api.tomtom.com", routeType = 'pickup' }) {
   console.log('=== TOMTOM BATCH REQUEST ===');
   console.log('School:', school);
   console.log('Bus clusters count:', busClusters.length);
   console.log('Bus clusters:', busClusters);
   console.log('Stops:', stops);
   
-  const items = busClusters.map(c => buildBatchItem({ apiKey, school, clusterStudents: c.students, stops, traffic, departAt, arriveAt, baseUrl }));
+  const items = busClusters.map(c => buildBatchItem({ apiKey, school, clusterStudents: c.students, stops, traffic, departAt, arriveAt, baseUrl, routeType }));
   const url = `${baseUrl}/routing/batch/sync/json`;
   const requestBody = { batchItems: items };
   
@@ -307,7 +545,7 @@ async function batchRouteTomTom({ apiKey, school, busClusters, stops = [], traff
   return { routes: out, unassigned_student_ids: unassigned };
 }
 
-async function planWithTomTom({ apiKey, school, students, buses, stops = [], useBatch = true, traffic = false, departAt, arriveAt, timeout, baseUrl }) {
+async function planWithTomTom({ apiKey, school, students, buses, stops = [], useBatch = true, traffic = false, departAt, arriveAt, timeout, baseUrl, routeType = 'pickup' }) {
   console.log('=== TOMTOM planWithTomTom FUNCTION ===');
   console.log('Input students count:', students.length);
   console.log('Input students:', students);
@@ -322,7 +560,7 @@ async function planWithTomTom({ apiKey, school, students, buses, stops = [], use
   
   if (useBatch) {
     console.log('=== USING BATCH MODE (POST) ===');
-    return batchRouteTomTom({ apiKey, school, busClusters, stops, traffic, departAt, arriveAt, timeout, baseUrl });
+    return batchRouteTomTom({ apiKey, school, busClusters, stops, traffic, departAt, arriveAt, timeout, baseUrl, routeType });
   } else {
     console.log('=== USING SINGLE MODE (GET) ===');
     const routes = [];

@@ -324,8 +324,8 @@ router.get('/stops', authenticateToken, authorizeRoles(['admin', 'dispatcher']),
         routes(id, name, type, is_active)
       `)
       .eq('routes.is_active', true)
-      .order('routes.name')
-      .order('stop_order');
+      .order('routes(name)', { ascending: true })
+      .order('stop_order', { ascending: true });
 
     if (error) {
       logger.error('Failed to fetch all stops', { error });

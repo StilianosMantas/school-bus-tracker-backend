@@ -16,7 +16,8 @@ const busSchema = Joi.object({
   engine_type: Joi.string().valid('petrol', 'diesel', 'gas', 'hybrid', 'electric').default('petrol'),
   width: Joi.number().positive().allow(null),
   length: Joi.number().positive().allow(null),
-  consumption_per_100km: Joi.number().positive().allow(null)
+  consumption_per_100km: Joi.number().positive().allow(null),
+  default_driver_id: Joi.string().uuid().allow(null, '')
 });
 
 // Health check
@@ -128,7 +129,7 @@ router.put('/:id', authenticateToken, authorizeRoles(['admin']), async (req, res
     const updates = {};
 
     // Validate and pick allowed fields
-    const allowedFields = ['bus_number', 'capacity', 'status', 'plate_number', 'engine_type', 'width', 'length', 'consumption_per_100km'];
+    const allowedFields = ['bus_number', 'capacity', 'status', 'plate_number', 'engine_type', 'width', 'length', 'consumption_per_100km', 'default_driver_id'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updates[field] = req.body[field];

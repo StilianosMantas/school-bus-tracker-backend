@@ -68,6 +68,7 @@ const studentAddressSchema = Joi.object({
   is_active: Joi.boolean().default(true),
   is_pickup_address: Joi.boolean().default(true),
   is_dropoff_address: Joi.boolean().default(true),
+  is_default: Joi.boolean().default(false),
   contact_person: Joi.string().max(100).allow('', null).optional(),
   contact_phone: Joi.string().pattern(/^(\+30)?[0-9]{10}$/).allow('', null).optional(),
   priority_order: Joi.number().integer().min(0).default(0)
@@ -291,6 +292,242 @@ router.delete('/time-slots/:id', authenticateToken, authorizeRoles(['admin']), a
     res.json({ message: 'Time slot deleted successfully' });
   } catch (error) {
     logger.error('Delete time slot error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get students with schedule status for student scheduling page (efficient single query)
+router.get('/with-schedule-status', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+
+    // Single comprehensive query to get all data
+    const { data: studentsData, error: studentsError } = await supabase
+      .from('students')
+      .select(`
+        id, name, grade, is_active, external_student_id,
+        parent:profiles!parent_id(id, full_name, phone, email),
+        addresses:student_addresses(
+          id, address_type, is_default, is_pickup_address, 
+          is_dropoff_address, is_active, full_address, latitude, longitude
+        ),
+        schedule:student_weekly_schedules(
+          day_of_week, pickup_address_id, pickup_time_slot_id,
+          dropoff_address_id, dropoff_time_slot_id, is_active
+        ),
+        exceptions:student_schedule_exceptions(
+          exception_date
+        )
+      `)
+      .order('name');
+
+    if (studentsError) {
+      logger.error('Error fetching students with schedule status', { error: studentsError });
+      throw new Error('Failed to fetch students: ' + studentsError.message);
+    }
+
+    // Calculate schedule status for each student
+    const studentsWithStatus = studentsData.map(student => {
+      const scheduleStatus = calculateScheduleStatus(student);
+      
+      return {
+        id: student.id,
+        name: student.name,
+        grade: student.grade,
+        is_active: student.is_active,
+        external_student_id: student.external_student_id,
+        parent: student.parent,
+        addresses: student.addresses || [],
+        schedule: student.schedule || [],
+        exceptions: student.exceptions || [],
+        schedule_status: scheduleStatus
+      };
+    });
+
+    res.json({
+      success: true,
+      data: studentsWithStatus
+    });
+
+  } catch (error) {
+    logger.error('Error in students with schedule status endpoint', { 
+      error: error.message,
+      userId: req.user.id
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch students with schedule status'
+    });
+  }
+});
+
+// Helper function to calculate schedule status
+function calculateScheduleStatus(student) {
+  const { schedule = [], exceptions = [] } = student;
+  
+  // Check for active future exceptions first (highest priority)
+  const today = new Date();
+  const activeExceptions = exceptions.filter(exception => {
+    const exceptionDate = new Date(exception.exception_date);
+    return exceptionDate >= today;
+  });
+  
+  if (activeExceptions.length > 0) {
+    return {
+      status: 'exception',
+      icon: '⏰',
+      title: `Έχει ${activeExceptions.length} ενεργή(ές) εξαίρεση(εις)`,
+      className: 'status-exception',
+      count: activeExceptions.length
+    };
+  }
+  
+  // Check schedule completeness (Monday to Friday = 1 to 5)
+  const workdays = [1, 2, 3, 4, 5];
+  const scheduledDays = schedule.filter(s => s.is_active && workdays.includes(s.day_of_week));
+  
+  // Check if each scheduled day has both pickup and dropoff
+  const completeScheduledDays = scheduledDays.filter(s => 
+    s.pickup_address_id && s.pickup_time_slot_id && 
+    s.dropoff_address_id && s.dropoff_time_slot_id
+  );
+  
+  if (completeScheduledDays.length === 0) {
+    return {
+      status: 'none',
+      icon: '🚫',
+      title: 'Χωρίς πρόγραμμα',
+      className: 'status-none',
+      count: 0
+    };
+  } else if (completeScheduledDays.length === workdays.length) {
+    return {
+      status: 'complete',
+      icon: '✅',
+      title: 'Πλήρες πρόγραμμα (όλες οι ημέρες)',
+      className: 'status-complete',
+      count: 5
+    };
+  } else {
+    return {
+      status: 'partial',
+      icon: '⚠️',
+      title: `Μερικό πρόγραμμα (${completeScheduledDays.length}/5 ημέρες)`,
+      className: 'status-partial',
+      count: completeScheduledDays.length
+    };
+  }
+}
+
+// Bulk update schedule for multiple students (Admin only)
+router.post('/bulk-schedule-update', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { students, scheduleData } = req.body;
+    
+    if (!students || !Array.isArray(students) || students.length === 0) {
+      return res.status(400).json({ error: 'Students array is required' });
+    }
+
+    if (!scheduleData || !scheduleData.selectedDays || scheduleData.selectedDays.length === 0) {
+      return res.status(400).json({ error: 'Schedule data with selected days is required' });
+    }
+
+    logger.info('Starting bulk schedule update', { 
+      studentCount: students.length, 
+      selectedDays: scheduleData.selectedDays,
+      userId: req.user.id 
+    });
+
+    // Prepare all schedule entries to insert/update
+    const allScheduleEntries = [];
+    
+    for (const student of students) {
+      for (const dayOfWeek of scheduleData.selectedDays) {
+        // Smart address selection logic
+        let pickupAddressId = scheduleData.pickup_address_id;
+        let dropoffAddressId = scheduleData.dropoff_address_id;
+
+        if (scheduleData.use_default_address && student.addresses) {
+          // Try to find default pickup and dropoff addresses
+          const defaultPickupAddress = student.addresses.find(addr => 
+            addr.is_default && addr.is_pickup_address && addr.is_active);
+          const defaultDropoffAddress = student.addresses.find(addr => 
+            addr.is_default && addr.is_dropoff_address && addr.is_active);
+          
+          // If defaults exist, use them
+          if (defaultPickupAddress) {
+            pickupAddressId = defaultPickupAddress.id;
+          }
+          if (defaultDropoffAddress) {
+            dropoffAddressId = defaultDropoffAddress.id;
+          }
+          
+          // If student has only one address, use it for both pickup and dropoff
+          const activeAddresses = student.addresses.filter(addr => addr.is_active);
+          if (activeAddresses.length === 1) {
+            const singleAddress = activeAddresses[0];
+            pickupAddressId = pickupAddressId || singleAddress.id;
+            dropoffAddressId = dropoffAddressId || singleAddress.id;
+          }
+          
+          // Final fallback to primary address if no defaults found
+          if (!pickupAddressId || !dropoffAddressId) {
+            const primaryAddress = student.addresses.find(addr => 
+              addr.address_type === 'primary' && addr.is_active);
+            if (primaryAddress) {
+              pickupAddressId = pickupAddressId || primaryAddress.id;
+              dropoffAddressId = dropoffAddressId || primaryAddress.id;
+            }
+          }
+        }
+
+        // Only add entries where we have valid address assignments
+        if (pickupAddressId || dropoffAddressId) {
+          allScheduleEntries.push({
+            student_id: student.id,
+            day_of_week: dayOfWeek,
+            pickup_address_id: pickupAddressId,
+            pickup_time_slot_id: scheduleData.pickup_time_slot_id,
+            dropoff_address_id: dropoffAddressId,
+            dropoff_time_slot_id: scheduleData.dropoff_time_slot_id,
+            is_active: true
+          });
+        }
+      }
+    }
+
+    if (allScheduleEntries.length === 0) {
+      return res.status(400).json({ error: 'No valid schedule entries could be created' });
+    }
+
+    // Perform bulk upsert
+    const { data, error } = await supabase
+      .from('student_weekly_schedules')
+      .upsert(allScheduleEntries, { 
+        onConflict: 'student_id,day_of_week',
+        ignoreDuplicates: false 
+      })
+      .select();
+
+    if (error) {
+      logger.error('Failed to bulk update student schedules', { error });
+      return res.status(500).json({ error: 'Failed to update schedules' });
+    }
+
+    logger.info('Bulk schedule update completed', { 
+      entriesCreated: data.length,
+      studentsAffected: students.length,
+      userId: req.user.id 
+    });
+
+    res.json({ 
+      success: true,
+      message: `Successfully updated schedules for ${students.length} students`,
+      entriesCreated: data.length,
+      data 
+    });
+
+  } catch (error) {
+    logger.error('Bulk schedule update error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1515,6 +1752,249 @@ router.post('/:studentId/routes/batch', authenticateToken, authorizeRoles(['admi
 
 // ==================== STUDENT ADDRESS MANAGEMENT ENDPOINTS ====================
 
+// Geocode and update all addresses without coordinates in one call
+// Get count of addresses without coordinates
+router.get('/addresses/stats', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    logger.info('Fetching address statistics');
+
+    // Get count of addresses without valid coordinates (null, empty, 0, or invalid values)
+    const { data: allAddresses, error: fetchError } = await supabase
+      .from('student_addresses')
+      .select('latitude, longitude')
+      .eq('is_active', true);
+
+    if (fetchError) {
+      logger.error('Error fetching addresses for validation:', fetchError);
+      throw fetchError;
+    }
+
+    // Count addresses with invalid coordinates
+    const withoutCoordinatesCount = allAddresses.filter(addr => {
+      const lat = addr.latitude;
+      const lon = addr.longitude;
+      
+      // Check for null, undefined, empty string, 0, or NaN values
+      return lat == null || lon == null || 
+             lat === '' || lon === '' ||
+             lat === 0 || lon === 0 ||
+             isNaN(Number(lat)) || isNaN(Number(lon));
+    }).length;
+
+    const stats = {
+      withoutCoordinates: withoutCoordinatesCount || 0
+    };
+
+    logger.info('Address statistics:', stats);
+
+    res.json({
+      success: true,
+      data: stats
+    });
+
+  } catch (error) {
+    logger.error('Error fetching address statistics:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch address statistics'
+    });
+  }
+});
+
+router.post('/addresses/geocode-and-update', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    // First, fetch addresses without coordinates
+    const { data: addresses, error: fetchError } = await supabase
+      .from('student_addresses')
+      .select(`
+        id,
+        student_id,
+        full_address,
+        address_type,
+        latitude,
+        longitude,
+        students!inner(id, name, is_active)
+      `)
+      .eq('students.is_active', true)
+      .eq('is_active', true)
+      .or('latitude.is.null,longitude.is.null')
+      .not('full_address', 'is', null)
+      .not('full_address', 'eq', '')
+      .order('created_at', { ascending: false });
+
+    if (fetchError) {
+      logger.error('Failed to fetch addresses without coordinates', { error: fetchError });
+      return res.status(500).json({ 
+        success: false,
+        error: 'Failed to fetch addresses' 
+      });
+    }
+
+    if (!addresses || addresses.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No addresses found without coordinates',
+        results: {
+          total: 0,
+          processed: 0,
+          successful: 0,
+          fromCache: 0,
+          fromApi: 0,
+          errors: 0,
+          details: []
+        }
+      });
+    }
+
+    logger.info(`Found ${addresses.length} addresses to geocode`, { userId: req.user.id });
+
+    // Import geocoding service
+    const geocodingService = require('../geocoding/geocoding-service');
+
+    // Process addresses in batches to avoid overwhelming the API
+    const BATCH_SIZE = 10;
+    const results = {
+      total: addresses.length,
+      processed: 0,
+      successful: 0,
+      fromCache: 0,
+      fromApi: 0,
+      errors: 0,
+      details: []
+    };
+
+    for (let i = 0; i < addresses.length; i += BATCH_SIZE) {
+      const batch = addresses.slice(i, i + BATCH_SIZE);
+      const batchAddresses = batch.map(addr => addr.full_address);
+      
+      try {
+        // Geocode the batch
+        const geocodeResults = await geocodingService.geocodeBatch(batchAddresses);
+        
+        // Update database with results
+        for (let j = 0; j < geocodeResults.length; j++) {
+          const geocodeResult = geocodeResults[j];
+          const addressRecord = batch[j];
+          
+          results.processed++;
+          
+          if (geocodeResult.coordinates) {
+            try {
+              // Update the database
+              const { error: updateError } = await supabase
+                .from('student_addresses')
+                .update({
+                  latitude: parseFloat(geocodeResult.coordinates.latitude),
+                  longitude: parseFloat(geocodeResult.coordinates.longitude),
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', addressRecord.id);
+
+              if (updateError) {
+                throw new Error(`Database update failed: ${updateError.message}`);
+              }
+
+              results.successful++;
+              
+              if (geocodeResult.coordinates.cached) {
+                results.fromCache++;
+              } else {
+                results.fromApi++;
+              }
+
+              results.details.push({
+                id: addressRecord.id,
+                student_name: addressRecord.students.name,
+                address: geocodeResult.address,
+                success: true,
+                cached: geocodeResult.coordinates.cached,
+                coordinates: geocodeResult.coordinates
+              });
+
+              logger.info('Address geocoded and updated successfully', {
+                addressId: addressRecord.id,
+                studentName: addressRecord.students.name,
+                address: geocodeResult.address,
+                cached: geocodeResult.coordinates.cached,
+                userId: req.user.id
+              });
+
+            } catch (updateError) {
+              results.errors++;
+              results.details.push({
+                id: addressRecord.id,
+                student_name: addressRecord.students.name,
+                address: geocodeResult.address,
+                success: false,
+                error: updateError.message
+              });
+              
+              logger.error('Failed to update address coordinates', {
+                addressId: addressRecord.id,
+                error: updateError.message,
+                userId: req.user.id
+              });
+            }
+          } else {
+            results.errors++;
+            results.details.push({
+              id: addressRecord.id,
+              student_name: addressRecord.students.name,
+              address: addressRecord.full_address,
+              success: false,
+              error: 'Could not geocode address'
+            });
+
+            logger.warn('Failed to geocode address', {
+              addressId: addressRecord.id,
+              address: addressRecord.full_address,
+              userId: req.user.id
+            });
+          }
+        }
+      } catch (batchError) {
+        logger.error('Batch geocoding failed', { 
+          error: batchError.message,
+          batchStart: i,
+          batchSize: batch.length,
+          userId: req.user.id
+        });
+        
+        // Mark all addresses in this batch as failed
+        batch.forEach(addressRecord => {
+          results.processed++;
+          results.errors++;
+          results.details.push({
+            id: addressRecord.id,
+            student_name: addressRecord.students.name,
+            address: addressRecord.full_address,
+            success: false,
+            error: `Batch geocoding failed: ${batchError.message}`
+          });
+        });
+      }
+    }
+
+    logger.info('Geocoding and update process completed', {
+      ...results,
+      userId: req.user.id
+    });
+
+    res.json({
+      success: true,
+      message: `Processed ${results.total} addresses. ${results.successful} successful, ${results.errors} errors.`,
+      results
+    });
+
+  } catch (error) {
+    logger.error('Geocode and update error', { error: error.message, userId: req.user.id });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
 // Get all addresses for a student
 router.get('/:studentId/addresses', authenticateToken, authorizeRoles(['admin', 'parent']), async (req, res) => {
   try {
@@ -1579,6 +2059,27 @@ router.post('/:studentId/addresses', authenticateToken, authorizeRoles(['admin']
         .update({ is_active: false })
         .eq('student_id', studentId)
         .eq('address_type', 'primary');
+    }
+
+    // If this is a default address, clear other defaults based on address type
+    if (value.is_default) {
+      if (value.is_pickup_address) {
+        await supabase
+          .from('student_addresses')
+          .update({ is_default: false })
+          .eq('student_id', studentId)
+          .eq('is_default', true)
+          .eq('is_pickup_address', true);
+      }
+      
+      if (value.is_dropoff_address) {
+        await supabase
+          .from('student_addresses')
+          .update({ is_default: false })
+          .eq('student_id', studentId)
+          .eq('is_default', true)
+          .eq('is_dropoff_address', true);
+      }
     }
 
     // Try to geocode the address (commented out for now - activate after testing)
@@ -1668,6 +2169,29 @@ router.put('/:studentId/addresses/:addressId', authenticateToken, authorizeRoles
         .eq('student_id', studentId)
         .eq('address_type', 'primary')
         .neq('id', addressId);
+    }
+
+    // If this is being set as default, clear other defaults based on address type
+    if (value.is_default) {
+      if (value.is_pickup_address) {
+        await supabase
+          .from('student_addresses')
+          .update({ is_default: false })
+          .eq('student_id', studentId)
+          .eq('is_default', true)
+          .eq('is_pickup_address', true)
+          .neq('id', addressId);
+      }
+      
+      if (value.is_dropoff_address) {
+        await supabase
+          .from('student_addresses')
+          .update({ is_default: false })
+          .eq('student_id', studentId)
+          .eq('is_default', true)
+          .eq('is_dropoff_address', true)
+          .neq('id', addressId);
+      }
     }
 
     // Try to geocode the address if full_address was updated (commented out for now)
@@ -1795,6 +2319,95 @@ router.delete('/:studentId/addresses/:addressId', authenticateToken, authorizeRo
   } catch (error) {
     logger.error('Delete student address error', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update address coordinates (for geocoding)
+router.put('/addresses/:addressId/coordinates', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const { addressId } = req.params;
+    const { latitude, longitude } = req.body;
+    
+    // Validate coordinates
+    if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Valid latitude and longitude numbers are required' 
+      });
+    }
+    
+    if (latitude < -90 || latitude > 90) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Latitude must be between -90 and 90' 
+      });
+    }
+    
+    if (longitude < -180 || longitude > 180) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Longitude must be between -180 and 180' 
+      });
+    }
+
+    // Update coordinates
+    const { data, error } = await supabase
+      .from('student_addresses')
+      .update({ 
+        latitude: parseFloat(latitude), 
+        longitude: parseFloat(longitude),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', addressId)
+      .eq('is_active', true)
+      .select(`
+        id,
+        student_id,
+        full_address,
+        address_type,
+        latitude,
+        longitude,
+        students!inner(id, name)
+      `)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ 
+          success: false,
+          error: 'Address not found or inactive' 
+        });
+      }
+      logger.error('Failed to update address coordinates', { error, addressId });
+      return res.status(500).json({ 
+        success: false,
+        error: 'Failed to update coordinates' 
+      });
+    }
+
+    logger.info('Address coordinates updated successfully', { 
+      addressId, 
+      studentId: data.student_id,
+      studentName: data.students.name,
+      address: data.full_address,
+      coordinates: { latitude, longitude },
+      userId: req.user.id 
+    });
+
+    res.json({ 
+      success: true,
+      data,
+      message: 'Coordinates updated successfully' 
+    });
+  } catch (error) {
+    logger.error('Update address coordinates error', { 
+      error: error.message, 
+      addressId: req.params.addressId 
+    });
+    res.status(500).json({ 
+      success: false,
+      error: 'Internal server error' 
+    });
   }
 });
 
@@ -2565,5 +3178,265 @@ router.post('/schedules/import', authenticateToken, authorizeRoles(['admin']), u
     }
   }
 });
+
+// ==================== BULK PREFILL ENDPOINTS ====================
+
+// Bulk prefill student schedules (Admin only)
+router.post('/schedules/bulk-prefill', authenticateToken, authorizeRoles(['admin']), async (req, res) => {
+  try {
+    const {
+      template_type,
+      apply_to,
+      pickup_time_slot_id,
+      dropoff_time_slot_id,
+      days_of_week,
+      overwrite_existing
+    } = req.body;
+
+    // Validate request parameters
+    if (!pickup_time_slot_id || !dropoff_time_slot_id) {
+      return res.status(400).json({ error: 'Pickup and dropoff time slots are required' });
+    }
+
+    if (!Array.isArray(days_of_week) || days_of_week.length === 0) {
+      return res.status(400).json({ error: 'Days of week must be a non-empty array' });
+    }
+
+    const validTemplateTypes = ['default_addresses', 'primary_addresses', 'manual_template'];
+    const validApplyTo = ['all_students', 'students_without_schedule', 'active_students_only'];
+
+    if (!validTemplateTypes.includes(template_type)) {
+      return res.status(400).json({ error: 'Invalid template type' });
+    }
+
+    if (!validApplyTo.includes(apply_to)) {
+      return res.status(400).json({ error: 'Invalid apply_to option' });
+    }
+
+    logger.info('Starting bulk prefill operation', {
+      template_type,
+      apply_to,
+      pickup_time_slot_id,
+      dropoff_time_slot_id,
+      days_of_week,
+      overwrite_existing,
+      userId: req.user.id
+    });
+
+    // Fetch target students based on apply_to criteria
+    let studentsQuery = supabase
+      .from('students')
+      .select(`
+        id, name, is_active,
+        student_addresses!inner(
+          id, address_type, is_default, is_pickup_address, is_dropoff_address, is_active
+        )
+      `)
+      .eq('student_addresses.is_active', true);
+
+    // Apply filtering based on apply_to parameter
+    if (apply_to === 'active_students_only') {
+      studentsQuery = studentsQuery.eq('is_active', true);
+    }
+
+    const { data: students, error: studentsError } = await studentsQuery;
+
+    if (studentsError) {
+      logger.error('Error fetching students for bulk prefill', { error: studentsError });
+      throw new Error('Failed to fetch students: ' + studentsError.message);
+    }
+
+    // Filter students without schedules if needed
+    let targetStudents = students;
+    if (apply_to === 'students_without_schedule') {
+      const studentsWithSchedules = [];
+      
+      for (const student of students) {
+        const { data: existingSchedules } = await supabase
+          .from('student_weekly_schedules')
+          .select('id')
+          .eq('student_id', student.id)
+          .eq('is_active', true);
+
+        if (!existingSchedules || existingSchedules.length === 0) {
+          studentsWithSchedules.push(student);
+        }
+      }
+      targetStudents = studentsWithSchedules;
+    }
+
+    let successful = 0;
+    let failed = 0;
+    const failureDetails = [];
+
+    // Process each student
+    for (const student of targetStudents) {
+      try {
+        // Determine pickup and dropoff addresses based on template type
+        let pickupAddressId = null;
+        let dropoffAddressId = null;
+
+        if (template_type === 'default_addresses') {
+          // Use default addresses
+          const pickupAddress = student.student_addresses.find(addr => 
+            addr.is_default && addr.is_pickup_address && addr.is_active);
+          const dropoffAddress = student.student_addresses.find(addr => 
+            addr.is_default && addr.is_dropoff_address && addr.is_active);
+
+          pickupAddressId = pickupAddress?.id || null;
+          dropoffAddressId = dropoffAddress?.id || null;
+
+        } else if (template_type === 'primary_addresses') {
+          // Use primary address for both pickup and dropoff
+          const primaryAddress = student.student_addresses.find(addr => 
+            addr.address_type === 'primary' && addr.is_active);
+
+          pickupAddressId = primaryAddress?.id || null;
+          dropoffAddressId = primaryAddress?.id || null;
+
+        } else if (template_type === 'manual_template') {
+          // For manual template, use primary address as fallback
+          const primaryAddress = student.student_addresses.find(addr => 
+            addr.address_type === 'primary' && addr.is_active);
+
+          pickupAddressId = primaryAddress?.id || null;
+          dropoffAddressId = primaryAddress?.id || null;
+        }
+
+        // Skip student if no addresses are available
+        if (!pickupAddressId || !dropoffAddressId) {
+          failed++;
+          failureDetails.push({
+            student_id: student.id,
+            student_name: student.name,
+            reason: 'No suitable addresses found for template type'
+          });
+          continue;
+        }
+
+        // Create schedules for specified days
+        const schedulesToCreate = [];
+        for (const dayOfWeek of days_of_week) {
+          const scheduleData = {
+            student_id: student.id,
+            day_of_week: dayOfWeek,
+            pickup_address_id: pickupAddressId,
+            pickup_time_slot_id: pickup_time_slot_id,
+            dropoff_address_id: dropoffAddressId,
+            dropoff_time_slot_id: dropoff_time_slot_id,
+            is_active: true,
+            notes: `Bulk prefilled - ${template_type}`
+          };
+
+          // Validate schedule data
+          const { error: validationError, value } = scheduleSchema.validate(scheduleData);
+          if (validationError) {
+            failed++;
+            failureDetails.push({
+              student_id: student.id,
+              student_name: student.name,
+              day_of_week: dayOfWeek,
+              reason: `Validation error: ${validationError.details[0].message}`
+            });
+            continue;
+          }
+
+          schedulesToCreate.push(value);
+        }
+
+        if (schedulesToCreate.length === 0) {
+          continue; // Skip if no valid schedules to create
+        }
+
+        // Handle existing schedules based on overwrite_existing flag
+        if (overwrite_existing) {
+          // Delete existing schedules for the days we're updating
+          const { error: deleteError } = await supabase
+            .from('student_weekly_schedules')
+            .delete()
+            .eq('student_id', student.id)
+            .in('day_of_week', days_of_week);
+
+          if (deleteError) {
+            logger.warn('Failed to delete existing schedules for student', { 
+              student_id: student.id, 
+              error: deleteError 
+            });
+          }
+        }
+
+        // Insert new schedules
+        const { data, error: insertError } = await supabase
+          .from('student_weekly_schedules')
+          .upsert(schedulesToCreate, { 
+            onConflict: 'student_id,day_of_week',
+            ignoreDuplicates: !overwrite_existing
+          })
+          .select();
+
+        if (insertError) {
+          failed++;
+          failureDetails.push({
+            student_id: student.id,
+            student_name: student.name,
+            reason: `Database error: ${insertError.message}`
+          });
+          logger.error('Failed to create schedules for student', { 
+            student_id: student.id, 
+            error: insertError 
+          });
+        } else {
+          successful++;
+          logger.debug('Successfully created schedules for student', { 
+            student_id: student.id,
+            schedules_created: data?.length || 0
+          });
+        }
+
+      } catch (error) {
+        failed++;
+        failureDetails.push({
+          student_id: student.id,
+          student_name: student.name,
+          reason: `Unexpected error: ${error.message}`
+        });
+        logger.error('Unexpected error processing student', { 
+          student_id: student.id, 
+          error: error.message 
+        });
+      }
+    }
+
+    const result = {
+      successful,
+      failed,
+      total_students_processed: targetStudents.length,
+      total_students_available: students.length,
+      template_type,
+      apply_to,
+      days_processed: days_of_week,
+      overwrite_existing,
+      failure_details: failureDetails
+    };
+
+    logger.info('Bulk prefill operation completed', {
+      ...result,
+      userId: req.user.id
+    });
+
+    res.json(result);
+
+  } catch (error) {
+    logger.error('Bulk prefill operation failed', { 
+      error: error.message,
+      userId: req.user.id
+    });
+    res.status(500).json({ 
+      error: 'Bulk prefill operation failed',
+      details: error.message
+    });
+  }
+});
+
 
 module.exports = router;

@@ -8,6 +8,24 @@ if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
 
+// Safe JSON stringifier that handles circular references
+const safeStringify = (obj) => {
+  const seen = new Set();
+  return JSON.stringify(obj, (key, value) => {
+    if (typeof value === 'object' && value !== null) {
+      if (seen.has(value)) {
+        return '[Circular]';
+      }
+      seen.add(value);
+    }
+    // Skip logging certain sensitive or problematic properties
+    if (key === 'req' || key === 'res' || key === 'socket' || key === 'connection') {
+      return '[Object]';
+    }
+    return value;
+  }, 2);
+};
+
 // Define log format
 const logFormat = winston.format.combine(
   winston.format.timestamp({
@@ -17,13 +35,24 @@ const logFormat = winston.format.combine(
   winston.format.splat(),
   winston.format.json(),
   winston.format.printf(({ timestamp, level, message, service, ...meta }) => {
-    return JSON.stringify({
-      timestamp,
-      level,
-      service: service || 'unknown',
-      message,
-      ...meta
-    }, null, 2);
+    try {
+      return safeStringify({
+        timestamp,
+        level,
+        service: service || 'unknown',
+        message,
+        ...meta
+      });
+    } catch (error) {
+      // Fallback if even safe stringify fails
+      return JSON.stringify({
+        timestamp,
+        level,
+        service: service || 'unknown',
+        message,
+        error: 'Failed to serialize log data'
+      }, null, 2);
+    }
   })
 );
 
