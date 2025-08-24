@@ -155,14 +155,18 @@ function buildTomTomPath({ school, students, stops = [], routeType = 'pickup' })
   
   console.log(`Built ${routeType} route path with ${parts.length} waypoints`);
   console.log('Route waypoints order:', parts);
+  console.log('Waypoints breakdown:');
+  parts.forEach((coord, index) => {
+    console.log(`  Waypoint ${index + 1}: ${coord}`);
+  });
   
-  return parts.join(":");
+  const finalPath = parts.join(":");
+  console.log('Final path string:', finalPath);
+  
+  return finalPath;
 }
 
 function extractOptimizedRoute(tomTomResponse, originalWaypoints) {
-  console.log('=== EXTRACTING OPTIMIZED ROUTE ===');
-  console.log('TomTom Response:', JSON.stringify(tomTomResponse, null, 2));
-  console.log('Original waypoints:', originalWaypoints);
   
   const { routes, optimizedWaypoints } = tomTomResponse;
   
@@ -174,21 +178,44 @@ function extractOptimizedRoute(tomTomResponse, originalWaypoints) {
   const route = routes[0];
   const legs = route.legs || [];
   
+  console.log('=== TOMTOM WAYPOINT RECONSTRUCTION ===');
+  console.log('Original waypoints count:', originalWaypoints.length);
+  console.log('Optimized waypoints from TomTom:', optimizedWaypoints);
+  
+  let reorderedWaypoints = [];
+  
   if (!optimizedWaypoints || optimizedWaypoints.length === 0) {
-    console.warn('No optimizedWaypoints found in TomTom response');
-    return { reorderedWaypoints: originalWaypoints, routeSegments: [] };
+    // No optimization data, use original order
+    console.log('No optimization data from TomTom, using original order');
+    reorderedWaypoints = originalWaypoints;
+  } else {
+    // TomTom's optimizedWaypoints contains only the middle waypoints that can be reordered
+    // providedIndex is relative to ONLY those middle waypoints, not the entire path
+    
+    // Extract the middle waypoints (exclude first and last from original)
+    const middleOriginalWaypoints = originalWaypoints.slice(1, -1);
+    console.log('Middle waypoints that were optimized:', middleOriginalWaypoints.map(w => w.id));
+    
+    // First waypoint is always fixed (not optimized)
+    reorderedWaypoints.push(originalWaypoints[0]);
+    
+    // Add the reordered middle waypoints
+    // providedIndex refers to the position in middleOriginalWaypoints array
+    const reorderedMiddle = optimizedWaypoints
+      .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
+      .map(wp => {
+        const waypoint = middleOriginalWaypoints[wp.providedIndex];
+        console.log(`Optimized middle waypoint ${wp.optimizedIndex}: Original middle index ${wp.providedIndex} = ${waypoint?.id}`);
+        return waypoint;
+      });
+    reorderedWaypoints.push(...reorderedMiddle);
+    
+    // Last waypoint is always fixed (not optimized)
+    reorderedWaypoints.push(originalWaypoints[originalWaypoints.length - 1]);
   }
   
-  // Sort optimizedWaypoints by their optimizedIndex to get the correct order
-  const reorderedWaypoints = optimizedWaypoints
-    .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
-    .map(wp => {
-      const originalWaypoint = originalWaypoints[wp.providedIndex];
-      console.log(`Waypoint ${wp.optimizedIndex}: Original index ${wp.providedIndex}`, originalWaypoint);
-      return originalWaypoint;
-    });
+  console.log('Final reordered waypoints:', reorderedWaypoints.map(w => ({type: w.type, id: w.id})));
   
-  console.log('Reordered waypoints:', reorderedWaypoints);
   
   // Create route segments from consecutive waypoints
   const routeSegments = reorderedWaypoints.slice(0, -1).map((fromWaypoint, i) => {
@@ -206,9 +233,6 @@ function extractOptimizedRoute(tomTomResponse, originalWaypoints) {
     console.log(`Segment ${i}:`, segment);
     return segment;
   });
-  
-  console.log('Route segments:', routeSegments);
-  console.log('=== END ROUTE EXTRACTION ===');
   
   return { reorderedWaypoints, routeSegments };
 }
@@ -312,16 +336,13 @@ async function routeBusTomTom({ apiKey, school, students, stops = [], traffic = 
   if (departAt) params.departAt = departAt;
   if (arriveAt) params.arriveAt = arriveAt;
   
+  const fullUrl = url + '?' + new URLSearchParams(params).toString();
   console.log('=== TOMTOM API REQUEST ===');
-  console.log('URL:', url);
-  console.log('Params:', params);
-  console.log('Full request URL:', url + '?' + new URLSearchParams(params).toString());
+  console.log('EXACT URL BEING CALLED:');
+  console.log(fullUrl);
+  console.log('Number of waypoints in path:', path.split(':').length);
   
   const res = await axios.get(url, { params, timeout });
-  
-  console.log('=== TOMTOM API RESPONSE ===');
-  console.log('Status:', res.status);
-  console.log('Response data keys:', Object.keys(res.data));
   
   // Build original waypoints array in the EXACT order they were sent to TomTom
   const originalWaypoints = [];
